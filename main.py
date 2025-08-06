@@ -1,10 +1,12 @@
 import discord
-from discord.ext import commands, tasks
+from discord import app_commands
+from discord.ext import tasks
 import os, random, json, asyncio
 from datetime import datetime, timedelta
 
 intents = discord.Intents.all()
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+bot = discord.Client(intents=intents)
+tree = app_commands.CommandTree(bot)
 
 # Data file path for persistent storage (Railway volume or current dir fallback)
 DATA_FILE = os.getenv("VOLUME_PATH", ".") + "/economy.json"
@@ -135,7 +137,6 @@ async def update_crypto_prices():
         change_percent = random.uniform(-0.05, 0.05)
         new_price = base_price * (1 + change_percent)
         CRYPTOCURRENCIES[crypto]["price"] = round(max(new_price, 0.01), 2)
-    print("Crypto prices updated:", {k: v['price'] for k, v in CRYPTOCURRENCIES.items()})
 
 # --- Coin investment price fluctuations (every 2 minutes) ---
 @tasks.loop(seconds=INVESTMENT_UPDATE_INTERVAL)
@@ -148,7 +149,6 @@ async def investment_price_fluctuation():
 # --- Smart news feature (random events) ---
 @tasks.loop(minutes=10)
 async def crypto_news_event():
-    # Random chance to boost or drop a crypto price drastically
     if random.random() < 0.3:
         crypto = random.choice(list(CRYPTOCURRENCIES.keys()))
         event_type = random.choice(["boost", "drop"])
@@ -156,9 +156,10 @@ async def crypto_news_event():
         old_price = CRYPTOCURRENCIES[crypto]["price"]
         new_price = max(0.01, old_price * multiplier)
         CRYPTOCURRENCIES[crypto]["price"] = round(new_price, 2)
-        channel = discord.utils.get(bot.get_all_channels(), name="general")  # adjust channel name
-        if channel:
-            await channel.send(f"📢 Crypto news: {crypto.capitalize()} price just {'rose' if event_type == 'boost' else 'fell'} sharply! New price: {CRYPTOCURRENCIES[crypto]['price']} coins")
+        for guild in bot.guilds:
+            channel = discord.utils.get(guild.text_channels, name="general")
+            if channel:
+                await channel.send(f"📢 Crypto news: {crypto.capitalize()} price just {'rose' if event_type == 'boost' else 'fell'} sharply! New price: {CRYPTOCURRENCIES[crypto]['price']} coins")
 
 @bot.event
 async def on_ready():
@@ -166,26 +167,30 @@ async def on_ready():
     update_crypto_prices.start()
     investment_price_fluctuation.start()
     crypto_news_event.start()
+    await tree.sync()
+    print("Slash commands synced.")
 
-# ---------------- Economy commands ----------------
+# --------------- Slash commands -------------------
 
-@bot.command()
-async def bal(ctx):
+@tree.command(name="bal", description="Check your balance and level")
+async def bal(interaction: discord.Interaction):
     data = load_data()
-    uid = str(ctx.author.id)
+    uid = str(interaction.user.id)
     ensure_user(data, uid)
     user = data[uid]
-    await ctx.send(f"💰 Balance: {user['bal']:,} | Level: {user['lvl']} | EXP: {user['exp']}/1000 | Job: {user['job'] or 'None'} Lv.{user.get('job_lvl',1)}")
+    await interaction.response.send_message(
+        f"💰 Balance: {user['bal']:,} | Level: {user['lvl']} | EXP: {user['exp']}/1000 | Job: {user['job'] or 'None'} Lv.{user.get('job_lvl',1)}"
+    )
 
-@bot.command()
-async def daily(ctx):
+@tree.command(name="daily", description="Claim your daily reward (cooldown)")
+async def daily(interaction: discord.Interaction):
     data = load_data()
-    uid = str(ctx.author.id)
+    uid = str(interaction.user.id)
     ensure_user(data, uid)
     user = data[uid]
     left = cooldown_left(user["daily"], BASE_COOLDOWN)
     if left > 0:
-        await ctx.send(f"🕒 You must wait {int(left // 60)}m {int(left % 60)}s for your daily reward.")
+        await interaction.response.send_message(f"🕒 You must wait {int(left // 60)}m {int(left % 60)}s for your daily reward.")
         return
     reward = random.randint(1500, 3500)
     user["bal"] += reward
@@ -196,20 +201,19 @@ async def daily(ctx):
     msg = f"✅ You collected your daily reward: +{reward:,} coins, +60 EXP"
     for key, desc, rew in earned_achievements:
         msg += f"\n🏆 Achievement unlocked: {desc} (+{rew:,} coins)"
-    await ctx.send(msg)
+    await interaction.response.send_message(msg)
 
-@bot.command()
-async def work(ctx):
+@tree.command(name="work", description="Work for coins (cooldown, can be boosted)")
+async def work(interaction: discord.Interaction):
     data = load_data()
-    uid = str(ctx.author.id)
+    uid = str(interaction.user.id)
     ensure_user(data, uid)
     user = data[uid]
     cooldown = get_work_cooldown(user)
     left = cooldown_left(user["work"], cooldown)
     if left > 0:
-        await ctx.send(f"🕒 You need to wait {int(left // 60)}m {int(left % 60)}s before working again.")
+        await interaction.response.send_message(f"🕒 You need to wait {int(left // 60)}m {int(left % 60)}s before working again.")
         return
-    # Calculate pay based on job and level
     base_pay = random.randint(1100, 2500)
     job_mult = 1.0
     if user["job"] in JOBS:
@@ -224,132 +228,128 @@ async def work(ctx):
     msg = f"💼 You worked as {user['job'] or 'a freelancer'} and earned {pay:,} coins, +45 EXP"
     for key, desc, rew in earned_achievements:
         msg += f"\n🏆 Achievement unlocked: {desc} (+{rew:,} coins)"
-    await ctx.send(msg)
+    await interaction.response.send_message(msg)
 
-@bot.command()
-async def inv(ctx):
+@tree.command(name="inv", description="Show your inventory")
+async def inv(interaction: discord.Interaction):
     data = load_data()
-    uid = str(ctx.author.id)
+    uid = str(interaction.user.id)
     ensure_user(data, uid)
     inv = data[uid]["inv"]
     if not inv or all(v <= 0 for v in inv.values()):
-        await ctx.send("🎒 Your inventory is empty.")
+        await interaction.response.send_message("🎒 Your inventory is empty.")
         return
     msg = "**🎒 Inventory:**\n"
     for item, amount in inv.items():
         if amount > 0:
             msg += f"{item} x{amount}\n"
-    await ctx.send(msg)
+    await interaction.response.send_message(msg)
 
-@bot.command()
-async def job(ctx, job_name: str = None):
+@tree.command(name="job", description="Choose or view your job")
+@app_commands.describe(job_name="Choose a job: hacker, trader, miner")
+async def job(interaction: discord.Interaction, job_name: str = None):
     data = load_data()
-    uid = str(ctx.author.id)
+    uid = str(interaction.user.id)
     ensure_user(data, uid)
     user = data[uid]
     if job_name is None:
         if user["job"]:
-            await ctx.send(f"👔 Your current job: {user['job']} {JOBS[user['job']]['emoji']} Lv.{user['job_lvl']}")
+            await interaction.response.send_message(f"👔 Your current job: {user['job']} {JOBS[user['job']]['emoji']} Lv.{user['job_lvl']}")
         else:
-            await ctx.send(f"ℹ️ You don't have a job. Choose one with `!job <hacker/trader/miner>`")
+            await interaction.response.send_message(f"ℹ️ You don't have a job. Choose one with `/job job_name:hacker|trader|miner`")
         return
     job_name = job_name.lower()
     if job_name not in JOBS:
-        await ctx.send("❌ Invalid job. Choose from: hacker, trader, miner.")
+        await interaction.response.send_message("❌ Invalid job. Choose from: hacker, trader, miner.")
         return
     user["job"] = job_name
     user["job_lvl"] = 1
     user["job_exp"] = 0
     save_data(data)
-    await ctx.send(f"✅ You started working as a {job_name} {JOBS[job_name]['emoji']}")
+    await interaction.response.send_message(f"✅ You started working as a {job_name} {JOBS[job_name]['emoji']}")
 
-# ------------- Shop with buying multiple amounts -----------------
-
-@bot.command()
-async def shop(ctx):
+@tree.command(name="shop", description="View crypto shop")
+async def shop(interaction: discord.Interaction):
     msg = "**🪙 Crypto Shop (prices update hourly):**\n"
     for crypto, info in CRYPTOCURRENCIES.items():
         price_str = f"{info['price']:,}" if info['price'] >= 1 else str(info['price'])
         msg += f"`{crypto}`: {price_str} coins — {info['desc']}\n"
-    msg += "\nUse `!buy <crypto> <amount>` to purchase multiple."
-    await ctx.send(msg)
+    msg += "\nUse `/buy item amount` to purchase multiple."
+    await interaction.response.send_message(msg)
 
-@bot.command()
-async def buy(ctx, item: str, amount: int = 1):
+@tree.command(name="buy", description="Buy crypto from the shop")
+@app_commands.describe(item="Crypto to buy", amount="Amount to buy")
+async def buy(interaction: discord.Interaction, item: str, amount: int = 1):
     if amount <= 0:
-        await ctx.send("❌ Amount must be a positive number.")
+        await interaction.response.send_message("❌ Amount must be a positive number.")
         return
     data = load_data()
-    uid = str(ctx.author.id)
+    uid = str(interaction.user.id)
     item = item.lower()
     ensure_user(data, uid)
     if item not in CRYPTOCURRENCIES:
-        await ctx.send("❌ That crypto is not available in the shop.")
+        await interaction.response.send_message("❌ That crypto is not available in the shop.")
         return
     cost = int(CRYPTOCURRENCIES[item]["price"] * amount)
     if data[uid]["bal"] < cost:
-        await ctx.send(f"❌ You don't have enough coins to buy {amount} {item}(s) ({cost:,} coins).")
+        await interaction.response.send_message(f"❌ You don't have enough coins to buy {amount} {item}(s) ({cost:,} coins).")
         return
     data[uid]["bal"] -= cost
     inv = data[uid]["inv"]
     inv[item] = inv.get(item, 0) + amount
     add_exp(data[uid], 20 * amount)
     save_data(data)
-    await ctx.send(f"✅ You bought {amount} {item}(s) for {cost:,} coins.")
+    await interaction.response.send_message(f"✅ You bought {amount} {item}(s) for {cost:,} coins.")
 
-@bot.command()
-async def sell(ctx, item: str, amount: int = 1):
+@tree.command(name="sell", description="Sell crypto from your inventory")
+@app_commands.describe(item="Crypto to sell", amount="Amount to sell")
+async def sell(interaction: discord.Interaction, item: str, amount: int = 1):
     if amount <= 0:
-        await ctx.send("❌ Amount must be a positive number.")
+        await interaction.response.send_message("❌ Amount must be a positive number.")
         return
     data = load_data()
-    uid = str(ctx.author.id)
+    uid = str(interaction.user.id)
     item = item.lower()
     ensure_user(data, uid)
     inv = data[uid]["inv"]
     if item not in inv or inv[item] < amount:
-        await ctx.send("❌ You don't own that many items to sell.")
+        await interaction.response.send_message("❌ You don't own that many items to sell.")
         return
     price = int(CRYPTOCURRENCIES.get(item, {"price":0})["price"] * 0.6 * amount)
     inv[item] -= amount
     data[uid]["bal"] += price
     save_data(data)
-    await ctx.send(f"✅ You sold {amount} {item}(s) for {price:,} coins.")
+    await interaction.response.send_message(f"✅ You sold {amount} {item}(s) for {price:,} coins.")
 
-# -------- Lootbox command --------
-
-@bot.command()
-async def lootbox(ctx):
+@tree.command(name="lootbox", description="Buy and open a lootbox for random rewards (cost 5000 coins)")
+async def lootbox(interaction: discord.Interaction):
     data = load_data()
-    uid = str(ctx.author.id)
+    uid = str(interaction.user.id)
     ensure_user(data, uid)
     user = data[uid]
     cost = 5000
     if user["bal"] < cost:
-        await ctx.send(f"❌ You need {cost:,} coins to buy a lootbox.")
+        await interaction.response.send_message(f"❌ You need {cost:,} coins to buy a lootbox.")
         return
     user["bal"] -= cost
 
-    # Randomly pick lootbox item
     loot = random.choice(LOOTBOX_ITEMS)
     if loot["type"] == "crypto":
         amount = random.randint(loot["min"], loot["max"])
         user["inv"][loot["item"]] = user["inv"].get(loot["item"], 0) + amount
         msg = f"🎁 You opened a lootbox and got {amount} {loot['item']}!"
-    else:  # booster
+    else:
         add_booster(user, loot["item"], loot["duration"])
         msg = f"🎁 You opened a lootbox and got a **{loot['item']}** booster active for {loot['duration']//60} minutes!"
 
     add_exp(user, 50)
     save_data(data)
-    await ctx.send(msg)
+    await interaction.response.send_message(msg)
 
-# -------- Work cooldown boosters info --------
-
-@bot.command()
-async def boosters(ctx):
+@tree.command(name="boosters", description="Show your active boosters")
+async def boosters(interaction: discord.Interaction):
     data = load_data()
-    uid = str(ctx.author.id)
+    uid = str(interaction.user.id)
     ensure_user(data, uid)
     user = data[uid]
     msg = "**🎁 Your Active Boosters:**\n"
@@ -364,20 +364,19 @@ async def boosters(ctx):
             msg += f"{booster}: {m}m {s}s remaining\n"
     if not active:
         msg += "None"
-    await ctx.send(msg)
+    await interaction.response.send_message(msg)
 
-# -------- Robbery system --------
-
-@bot.command()
-async def rob(ctx, target: discord.Member):
+@tree.command(name="rob", description="Attempt to rob another user (30 min cooldown)")
+@app_commands.describe(target="User to rob")
+async def rob(interaction: discord.Interaction, target: discord.User):
     if target.bot:
-        await ctx.send("❌ You can't rob bots.")
+        await interaction.response.send_message("❌ You can't rob bots.")
         return
-    if target == ctx.author:
-        await ctx.send("❌ You can't rob yourself.")
+    if target == interaction.user:
+        await interaction.response.send_message("❌ You can't rob yourself.")
         return
     data = load_data()
-    uid = str(ctx.author.id)
+    uid = str(interaction.user.id)
     tid = str(target.id)
     ensure_user(data, uid)
     ensure_user(data, tid)
@@ -386,270 +385,121 @@ async def rob(ctx, target: discord.Member):
     target_user = data[tid]
 
     cooldown_key = "rob"
-    left = cooldown_left(user["cooldowns"].get(cooldown_key), 1800)  # 30 min cooldown
+    left = cooldown_left(user["cooldowns"].get(cooldown_key), 1800)
     if left > 0:
-        await ctx.send(f"🕒 You must wait {int(left // 60)}m {int(left % 60)}s before robbing again.")
+        await interaction.response.send_message(f"🕒 You must wait {int(left//60)}m {int(left%60)}s before robbing again.")
         return
-
-    if target_user["bal"] < 100:
-        await ctx.send("❌ Target doesn't have enough money to rob.")
+    if target_user["bal"] < 1000:
+        await interaction.response.send_message("❌ Target has less than 1000 coins, not worth robbing.")
         return
 
     success_chance = 0.4
     if random.random() < success_chance:
-        # Rob success: steal 10-30% of target's balance
-        steal_amount = int(target_user["bal"] * random.uniform(0.1, 0.3))
-        steal_amount = max(50, steal_amount)
-        steal_amount = min(steal_amount, target_user["bal"])
-        target_user["bal"] -= steal_amount
-        user["bal"] += steal_amount
-        user["cooldowns"][cooldown_key] = datetime.utcnow().isoformat()
-        save_data(data)
-        await ctx.send(f"💰 You robbed {target.display_name} and stole {steal_amount:,} coins!")
+        stolen = random.randint(500, min(5000, target_user["bal"]))
+        target_user["bal"] -= stolen
+        user["bal"] += stolen
+        msg = f"💰 Robbery successful! You stole {stolen:,} coins from {target.name}."
     else:
-        # Rob fail: lose some money as penalty
-        penalty = random.randint(100, 300)
-        penalty = min(penalty, user["bal"])
-        user["bal"] -= penalty
-        user["cooldowns"][cooldown_key] = datetime.utcnow().isoformat()
-        save_data(data)
-        await ctx.send(f"❌ You got caught trying to rob {target.display_name}! You paid a penalty of {penalty:,} coins.")
+        fine = random.randint(200, 1000)
+        user["bal"] = max(0, user["bal"] - fine)
+        msg = f"🚨 Robbery failed! You got caught and paid a fine of {fine:,} coins."
 
-# -------- Gambling: coinflip --------
+    user["cooldowns"][cooldown_key] = datetime.utcnow().isoformat()
+    save_data(data)
+    await interaction.response.send_message(msg)
 
-@bot.command()
-async def coinflip(ctx, bet: int, guess: str):
+@tree.command(name="coinflip", description="Bet coins on a coin flip game")
+@app_commands.describe(bet="Amount to bet", guess="Heads or tails")
+async def coinflip(interaction: discord.Interaction, bet: int, guess: str):
     guess = guess.lower()
-    if bet <= 0 or bet > MAX_BET:
-        await ctx.send(f"❌ Bet must be positive and at most {MAX_BET:,} coins.")
-        return
     if guess not in ["heads", "tails"]:
-        await ctx.send("❌ Guess must be 'heads' or 'tails'.")
+        await interaction.response.send_message("❌ Guess must be 'heads' or 'tails'.")
         return
+    if bet <= 0 or bet > MAX_BET:
+        await interaction.response.send_message(f"❌ Bet must be positive and at most {MAX_BET:,} coins.")
+        return
+
     data = load_data()
-    uid = str(ctx.author.id)
+    uid = str(interaction.user.id)
     ensure_user(data, uid)
     user = data[uid]
     if user["bal"] < bet:
-        await ctx.send("❌ You don't have enough coins for that bet.")
+        await interaction.response.send_message("❌ You don't have enough coins.")
         return
-    flip = random.choice(["heads", "tails"])
-    if flip == guess:
-        win = bet * 2
-        user["bal"] += bet
-        add_exp(user, 25)
-        await ctx.send(f"🎉 You won! The coin landed on {flip}. You gained {bet:,} coins.")
+
+    result = random.choice(["heads", "tails"])
+    if guess == result:
+        winnings = bet
+        user["bal"] += winnings
+        outcome = f"🎉 You won {winnings:,} coins!"
     else:
         user["bal"] -= bet
-        await ctx.send(f"😢 You lost! The coin landed on {flip}. You lost {bet:,} coins.")
+        outcome = f"😢 You lost {bet:,} coins."
+
     save_data(data)
+    await interaction.response.send_message(f"Coinflip result: **{result}**. {outcome}")
 
-# -------- Gambling: slots --------
-
-@bot.command()
-async def slots(ctx, bet: int):
+@tree.command(name="slots", description="Play a slot machine game")
+@app_commands.describe(bet="Amount to bet")
+async def slots(interaction: discord.Interaction, bet: int):
     if bet <= 0 or bet > MAX_BET:
-        await ctx.send(f"❌ Bet must be positive and at most {MAX_BET:,} coins.")
+        await interaction.response.send_message(f"❌ Bet must be positive and at most {MAX_BET:,} coins.")
         return
+
     data = load_data()
-    uid = str(ctx.author.id)
+    uid = str(interaction.user.id)
     ensure_user(data, uid)
     user = data[uid]
     if user["bal"] < bet:
-        await ctx.send("❌ You don't have enough coins for that bet.")
+        await interaction.response.send_message("❌ You don't have enough coins.")
         return
-    symbols = ["🍒", "🍋", "🍊", "💎", "7️⃣"]
+
+    symbols = ["🍒", "🍋", "🍊", "🍇", "⭐", "7️⃣"]
     result = [random.choice(symbols) for _ in range(3)]
-    user["bal"] -= bet
-    if result[0] == result[1] == result[2]:
-        payout = bet * 5
-        user["bal"] += payout
-        add_exp(user, 50)
-        await ctx.send(f"🎰 {' | '.join(result)}\nJackpot! You won {payout:,} coins!")
-    elif len(set(result)) == 2:  # two symbols match
-        payout = bet * 2
-        user["bal"] += payout
-        add_exp(user, 20)
-        await ctx.send(f"🎰 {' | '.join(result)}\nNice! Two match. You won {payout:,} coins!")
+
+    # Simple slot rules
+    if len(set(result)) == 1:
+        # Jackpot
+        winnings = bet * 5
+    elif len(set(result)) == 2:
+        winnings = bet * 2
     else:
-        await ctx.send(f"🎰 {' | '.join(result)}\nNo luck this time. You lost {bet:,} coins.")
+        winnings = -bet
+
+    user["bal"] += winnings
     save_data(data)
-
-# -------- Gambling: cups (reaction buttons) --------
-# For simplicity, will use text command cups with 3 cups and user picks a cup number 1-3
-
-@bot.command()
-async def cups(ctx, bet: int, choice: int):
-    if bet <= 0 or bet > MAX_BET:
-        await ctx.send(f"❌ Bet must be positive and at most {MAX_BET:,} coins.")
-        return
-    if choice not in [1, 2, 3]:
-        await ctx.send("❌ Choose a cup number between 1 and 3.")
-        return
-    data = load_data()
-    uid = str(ctx.author.id)
-    ensure_user(data, uid)
-    user = data[uid]
-    if user["bal"] < bet:
-        await ctx.send("❌ You don't have enough coins for that bet.")
-        return
-    user["bal"] -= bet
-    winning_cup = random.randint(1, 3)
-    if choice == winning_cup:
-        payout = bet * 3
-        user["bal"] += payout
-        add_exp(user, 40)
-        await ctx.send(f"🥤 You picked cup {choice}, and it was correct! You won {payout:,} coins.")
+    outcome = f" | ".join(result)
+    if winnings > 0:
+        msg = f"{outcome}\n🎉 You won {winnings:,} coins!"
     else:
-        await ctx.send(f"🥤 You picked cup {choice}, but the prize was under cup {winning_cup}. You lost {bet:,} coins.")
-    save_data(data)
+        msg = f"{outcome}\n😢 You lost {bet:,} coins."
+    await interaction.response.send_message(msg)
 
-# -------- Achievements --------
+@tree.command(name="help", description="Show help info")
+async def help(interaction: discord.Interaction):
+    msg = (
+        "**Bot Commands:**\n"
+        "/bal - Check your balance and level\n"
+        "/daily - Claim daily coins\n"
+        "/work - Work for coins\n"
+        "/inv - Show your inventory\n"
+        "/job [job_name] - Choose/view job\n"
+        "/shop - Show crypto shop\n"
+        "/buy item amount - Buy crypto\n"
+        "/sell item amount - Sell crypto\n"
+        "/lootbox - Open lootbox\n"
+        "/boosters - Show your boosters\n"
+        "/rob @user - Rob another user\n"
+        "/coinflip bet heads/tails - Play coinflip\n"
+        "/slots bet - Play slots\n"
+        "/help - Show this message"
+    )
+    await interaction.response.send_message(msg)
 
-@bot.command()
-async def achievements(ctx):
-    data = load_data()
-    uid = str(ctx.author.id)
-    ensure_user(data, uid)
-    user = data[uid]
-    if not user["achievements"]:
-        await ctx.send("🏆 You have no achievements yet. Keep playing!")
-        return
-    msg = "**🏆 Your Achievements:**\n"
-    for key in user["achievements"]:
-        msg += f"- {ACHIEVEMENTS[key]['desc']}\n"
-    await ctx.send(msg)
+# Run bot
+bot_token = os.getenv("DISCORD_BOT_TOKEN")
+if not bot_token:
+    print("ERROR: DISCORD_BOT_TOKEN env var not set!")
+    exit(1)
 
-# -------- Daily quests (simple and rewarding) --------
-
-@bot.command()
-async def quest(ctx):
-    data = load_data()
-    uid = str(ctx.author.id)
-    ensure_user(data, uid)
-    user = data[uid]
-    if user["daily_quests"]["claimed"]:
-        await ctx.send("✅ You already claimed your daily quest rewards. New quests come tomorrow.")
-        return
-    # If no quests or all completed, generate new quests
-    if not user["daily_quests"]["quests"]:
-        quests = [
-            {"task": "work", "desc": "Work once", "done": False, "reward": 800},
-            {"task": "rob", "desc": "Rob a player once", "done": False, "reward": 1200},
-            {"task": "gamble", "desc": "Win 1 gamble game", "done": False, "reward": 1000},
-        ]
-        user["daily_quests"]["quests"] = quests
-        user["daily_quests"]["claimed"] = False
-        save_data(data)
-    msg = "**🎯 Daily Quests:**\n"
-    for i, q in enumerate(user["daily_quests"]["quests"], 1):
-        status = "✅" if q["done"] else "❌"
-        msg += f"{i}. {q['desc']} {status}\n"
-    msg += "\nComplete quests and use `!claim` to get rewards."
-    await ctx.send(msg)
-
-@bot.command()
-async def claim(ctx):
-    data = load_data()
-    uid = str(ctx.author.id)
-    ensure_user(data, uid)
-    user = data[uid]
-    if user["daily_quests"]["claimed"]:
-        await ctx.send("❌ You already claimed your daily quests rewards.")
-        return
-    total_reward = 0
-    for q in user["daily_quests"]["quests"]:
-        if q["done"]:
-            total_reward += q["reward"]
-    if total_reward == 0:
-        await ctx.send("❌ You haven't completed any quests yet.")
-        return
-    user["bal"] += total_reward
-    user["daily_quests"]["claimed"] = True
-    save_data(data)
-    await ctx.send(f"🎉 You claimed {total_reward:,} coins from your daily quests!")
-
-# You can add hooks or triggers on certain commands to mark quests as done, e.g. on work, rob, gamble commands,
-# but for simplicity, user must manually mark them or it can be extended later.
-
-# -------- Admin commands --------
-
-@bot.command()
-@commands.is_owner()
-async def resetdata(ctx, user: discord.User = None):
-    data = load_data()
-    if user:
-        uid = str(user.id)
-        if uid in data:
-            del data[uid]
-            save_data(data)
-            await ctx.send(f"✅ Data for {user} reset.")
-        else:
-            await ctx.send("❌ User data not found.")
-    else:
-        # Reset all data (careful!)
-        save_data({})
-        await ctx.send("✅ All data reset.")
-
-@bot.command()
-@commands.is_owner()
-async def resetcd(ctx, user: discord.User = None):
-    data = load_data()
-    if user:
-        uid = str(user.id)
-        if uid in data:
-            data[uid]["cooldowns"] = {}
-            save_data(data)
-            await ctx.send(f"✅ Cooldowns reset for {user}.")
-        else:
-            await ctx.send("❌ User data not found.")
-    else:
-        # Reset cooldowns for all users
-        for uid in data:
-            data[uid]["cooldowns"] = {}
-        save_data(data)
-        await ctx.send("✅ All cooldowns reset.")
-
-# -------------- Help command --------------
-
-@bot.command(name="help")
-async def help_cmd(ctx):
-    msg = """**📚 Bot Commands:**
-
-**Economy:**
-`!bal` - Check your balance and level
-`!daily` - Claim daily reward (cooldown)
-`!work` - Work for coins (cooldown, can be boosted)
-`!inv` - Show your inventory
-`!job [job]` - Choose/view your job (hacker, trader, miner)
-`!shop` - View crypto shop
-`!buy <crypto> <amount>` - Buy crypto
-`!sell <crypto> <amount>` - Sell crypto
-
-**Gambling (max bet 250,000):**
-`!coinflip <bet> <heads/tails>`
-`!slots <bet>`
-`!cups <bet> <cup number (1-3)>`
-
-**Other:**
-`!lootbox` - Buy and open a lootbox for random rewards (cost 5000 coins)
-`!boosters` - Show your active boosters
-`!rob <user>` - Attempt to rob another user (30 min cooldown)
-`!achievements` - View your achievements
-`!quest` - View daily quests
-`!claim` - Claim daily quests rewards
-
-**Admin (owner only):**
-`!resetdata [@user]` - Reset user or all data
-`!resetcd [@user]` - Reset cooldowns for user or all
-
-"""
-    await ctx.send(msg)
-
-# ------------- Run bot -------------
-
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-if not TOKEN:
-    print("ERROR: DISCORD_BOT_TOKEN env variable not set!")
-else:
-    bot.run(TOKEN)
+bot.run(bot_token)
