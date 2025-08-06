@@ -45,4 +45,11 @@ async def on_ready():
 async def ping(ctx):
     await ctx.send("🏓 Pong!")
 
-@bot.comman
+@bot.command()
+async def joke(ctx):
+    jokes = [
+        "Why don’t scientists trust atoms? Because they make up everything!",
+        "I told my computer I needed a break, and it said 'No problem, I’ll go to sleep.'",
+        "Why did the scarecrow win an award? Because he was outstanding in his field!"
+    ]
+    await ctx.send(random.choice(jokes)
