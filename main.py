@@ -4,15 +4,17 @@ import os, random, json, asyncio
 from datetime import datetime, timedelta
 
 intents = discord.Intents.all()
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
+# Data file path for persistent storage (Railway volume or current dir fallback)
 DATA_FILE = os.getenv("VOLUME_PATH", ".") + "/economy.json"
-MAX_BET = 250_000
-WORK_COOLDOWN = 40 * 60  # seconds
-ROB_COOLDOWN = 30 * 60
-INVEST_UPDATE_INTERVAL = 120  # seconds
 
-# Initial cryptos with base prices and descriptions
+# Constants
+MAX_BET = 250_000
+BASE_COOLDOWN = 40 * 60  # 40 minutes cooldown (can be reduced by boosters)
+INVESTMENT_UPDATE_INTERVAL = 120  # seconds
+
+# Initial crypto shop list
 CRYPTOCURRENCIES = {
     "bitcoin": {"price": 50000, "desc": "BTC - Most popular crypto"},
     "ethereum": {"price": 3200, "desc": "ETH - Smart contracts"},
@@ -21,27 +23,31 @@ CRYPTOCURRENCIES = {
     "ripple": {"price": 1, "desc": "XRP - Bank payments"},
 }
 
-# Job definitions
+# Job info (emoji, base pay multiplier)
 JOBS = {
-    "hacker": {"emoji": "🕵️‍♂️", "base_income": 1500},
-    "trader": {"emoji": "💹", "base_income": 1300},
-    "miner": {"emoji": "⛏️", "base_income": 1100},
+    "hacker": {"emoji": "🧑‍💻", "base_pay": 1.2},
+    "trader": {"emoji": "📈", "base_pay": 1.1},
+    "miner": {"emoji": "⛏️", "base_pay": 1.0},
 }
 
-# Achievements example (easy to earn)
+# Achievements (easy to earn)
 ACHIEVEMENTS = {
-    "first_work": {"desc": "Complete your first work", "exp": 100, "coins": 500},
-    "reach_lvl_5": {"desc": "Reach level 5", "exp": 500, "coins": 2500},
-    "buy_10_crypto": {"desc": "Buy 10 cryptos in total", "exp": 300, "coins": 1500},
+    "first_daily": {"desc": "Claim your first daily reward", "condition": lambda d,u: d[u].get("daily") is not None, "reward": 500},
+    "first_work": {"desc": "Work for the first time", "condition": lambda d,u: d[u].get("work") is not None, "reward": 500},
+    "own_bitcoin": {"desc": "Own at least 1 bitcoin", "condition": lambda d,u: d[u]["inv"].get("bitcoin", 0) >= 1, "reward": 1000},
+    "level_5": {"desc": "Reach level 5", "condition": lambda d,u: d[u]["lvl"] >= 5, "reward": 1500},
 }
 
-# Daily quests example
-DAILY_QUESTS = [
-    {"desc": "Earn 3,000 coins today", "check": lambda u: u.get("coins_earned_today", 0) >= 3000, "reward_exp": 100, "reward_coins": 1000},
-    {"desc": "Gain 100 EXP today", "check": lambda u: u.get("exp_gained_today", 0) >= 100, "reward_exp": 80, "reward_coins": 800},
+# Lootbox items and boosters
+LOOTBOX_ITEMS = [
+    {"type": "crypto", "item": "bitcoin", "min": 1, "max": 1},
+    {"type": "crypto", "item": "ethereum", "min": 1, "max": 3},
+    {"type": "crypto", "item": "dogecoin", "min": 50, "max": 200},
+    {"type": "booster", "item": "work_boost", "duration": 3600},  # 1 hour booster
 ]
 
-# Load and save user data
+# Helper functions for data handling
+
 def load_data():
     try:
         with open(DATA_FILE, "r") as f:
@@ -61,27 +67,24 @@ def ensure_user(data, uid):
             "lvl": 1,
             "daily": None,
             "work": None,
-            "rob": None,
             "inv": {},
+            "achievements": [],
             "job": None,
             "job_lvl": 1,
-            "achievements": [],
-            "coins_earned_today": 0,
-            "exp_gained_today": 0,
-            "daily_quest_completed": False,
-            "work_booster": 0,  # number of boosters owned
-            "investments": {},  # crypto: amount
+            "job_exp": 0,
+            "boosters": {},  # e.g., {"work_boost": expiry_timestamp_iso}
+            "cooldowns": {},  # generic cooldown dict (e.g. robbery)
+            "daily_quests": {"claimed": False, "quests": []},
         }
 
-def cooldown_left(last_time, cd):
+def cooldown_left(last_time, cooldown_sec):
     if not last_time:
         return 0
     delta = (datetime.utcnow() - datetime.fromisoformat(last_time)).total_seconds()
-    return max(0, cd - delta)
+    return max(0, cooldown_sec - delta)
 
 def add_exp(user, amount):
     user["exp"] += amount
-    user["exp_gained_today"] = user.get("exp_gained_today", 0) + amount
     leveled_up = False
     while user["exp"] >= 1000:
         user["exp"] -= 1000
@@ -89,72 +92,82 @@ def add_exp(user, amount):
         leveled_up = True
     return leveled_up
 
-def add_coins_earned_today(user, amount):
-    user["coins_earned_today"] = user.get("coins_earned_today", 0) + amount
+def add_job_exp(user, amount):
+    user["job_exp"] += amount
+    leveled_up = False
+    while user["job_exp"] >= 500:
+        user["job_exp"] -= 500
+        user["job_lvl"] += 1
+        leveled_up = True
+    return leveled_up
 
-# Update crypto prices hourly with fluctuations
+def has_booster(user, booster_name):
+    if booster_name not in user.get("boosters", {}):
+        return False
+    expiry = datetime.fromisoformat(user["boosters"][booster_name])
+    return expiry > datetime.utcnow()
+
+def add_booster(user, booster_name, duration_sec):
+    expiry = datetime.utcnow() + timedelta(seconds=duration_sec)
+    user.setdefault("boosters", {})[booster_name] = expiry.isoformat()
+
+def get_work_cooldown(user):
+    base = BASE_COOLDOWN
+    if has_booster(user, "work_boost"):
+        base = int(base * 0.5)  # 50% cooldown reduction
+    return base
+
+def update_achievements(data, uid):
+    user = data[uid]
+    earned = []
+    for key, ach in ACHIEVEMENTS.items():
+        if key not in user["achievements"] and ach["condition"](data, uid):
+            user["achievements"].append(key)
+            user["bal"] += ach["reward"]
+            earned.append((key, ach["desc"], ach["reward"]))
+    return earned
+
+# --- Crypto price updater (every hour) ---
 @tasks.loop(hours=1)
 async def update_crypto_prices():
     for crypto in CRYPTOCURRENCIES:
         base_price = CRYPTOCURRENCIES[crypto]["price"]
-        change_percent = random.uniform(-0.05, 0.05)  # ±5%
+        change_percent = random.uniform(-0.05, 0.05)
         new_price = base_price * (1 + change_percent)
         CRYPTOCURRENCIES[crypto]["price"] = round(max(new_price, 0.01), 2)
+    print("Crypto prices updated:", {k: v['price'] for k, v in CRYPTOCURRENCIES.items()})
 
-# Update crypto prices & run crypto news every hour
-@tasks.loop(hours=1)
-async def crypto_news_event():
-    # Fake news affecting crypto prices ±3-7%
-    crypto = random.choice(list(CRYPTOCURRENCIES.keys()))
-    impact = random.uniform(0.03, 0.07)
-    up = random.choice([True, False])
-    old_price = CRYPTOCURRENCIES[crypto]["price"]
-    new_price = old_price * (1 + impact if up else 1 - impact)
-    CRYPTOCURRENCIES[crypto]["price"] = round(max(new_price, 0.01), 2)
-    channel = discord.utils.get(bot.get_all_channels(), name="general")  # replace with your channel name
-    if channel:
-        msg = f"📰 Crypto news: {crypto.title()} price {'surged 📈' if up else 'dropped 📉'} by {int(impact*100)}%! New price: {CRYPTOCURRENCIES[crypto]['price']}"
-        await channel.send(msg)
-
-# Update investments every 2 minutes, prices fluctuate ±3%
-@tasks.loop(seconds=INVEST_UPDATE_INTERVAL)
-async def update_investments():
+# --- Coin investment price fluctuations (every 2 minutes) ---
+@tasks.loop(seconds=INVESTMENT_UPDATE_INTERVAL)
+async def investment_price_fluctuation():
     for crypto in CRYPTOCURRENCIES:
-        base_price = CRYPTOCURRENCIES[crypto]["price"]
         change_percent = random.uniform(-0.03, 0.03)
-        new_price = base_price * (1 + change_percent)
+        new_price = CRYPTOCURRENCIES[crypto]["price"] * (1 + change_percent)
         CRYPTOCURRENCIES[crypto]["price"] = round(max(new_price, 0.01), 2)
+
+# --- Smart news feature (random events) ---
+@tasks.loop(minutes=10)
+async def crypto_news_event():
+    # Random chance to boost or drop a crypto price drastically
+    if random.random() < 0.3:
+        crypto = random.choice(list(CRYPTOCURRENCIES.keys()))
+        event_type = random.choice(["boost", "drop"])
+        multiplier = random.uniform(1.1, 1.3) if event_type == "boost" else random.uniform(0.7, 0.9)
+        old_price = CRYPTOCURRENCIES[crypto]["price"]
+        new_price = max(0.01, old_price * multiplier)
+        CRYPTOCURRENCIES[crypto]["price"] = round(new_price, 2)
+        channel = discord.utils.get(bot.get_all_channels(), name="general")  # adjust channel name
+        if channel:
+            await channel.send(f"📢 Crypto news: {crypto.capitalize()} price just {'rose' if event_type == 'boost' else 'fell'} sharply! New price: {CRYPTOCURRENCIES[crypto]['price']} coins")
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     update_crypto_prices.start()
+    investment_price_fluctuation.start()
     crypto_news_event.start()
-    update_investments.start()
 
-# Helper to check and grant achievements
-def check_achievements(user):
-    unlocked = []
-    # first_work
-    if "first_work" not in user["achievements"] and user.get("work_done", 0) >= 1:
-        unlocked.append("first_work")
-    # reach_lvl_5
-    if "reach_lvl_5" not in user["achievements"] and user["lvl"] >= 5:
-        unlocked.append("reach_lvl_5")
-    # buy_10_crypto
-    total_crypto = sum(user["inv"].values())
-    if "buy_10_crypto" not in user["achievements"] and total_crypto >= 10:
-        unlocked.append("buy_10_crypto")
-    return unlocked
-
-def grant_achievements(user, unlocked, data):
-    for ach in unlocked:
-        if ach not in user["achievements"]:
-            user["achievements"].append(ach)
-            user["exp"] += ACHIEVEMENTS[ach]["exp"]
-            user["bal"] += ACHIEVEMENTS[ach]["coins"]
-
-# Economy commands:
+# ---------------- Economy commands ----------------
 
 @bot.command()
 async def bal(ctx):
@@ -162,24 +175,28 @@ async def bal(ctx):
     uid = str(ctx.author.id)
     ensure_user(data, uid)
     user = data[uid]
-    await ctx.send(f"💰 Balance: {user['bal']} | Level: {user['lvl']} | EXP: {user['exp']}/1000 | Job: {user['job'] or 'None'} (Lvl {user['job_lvl']})")
+    await ctx.send(f"💰 Balance: {user['bal']:,} | Level: {user['lvl']} | EXP: {user['exp']}/1000 | Job: {user['job'] or 'None'} Lv.{user.get('job_lvl',1)}")
 
 @bot.command()
 async def daily(ctx):
     data = load_data()
     uid = str(ctx.author.id)
     ensure_user(data, uid)
-    left = cooldown_left(data[uid]["daily"], 24 * 3600)
+    user = data[uid]
+    left = cooldown_left(user["daily"], BASE_COOLDOWN)
     if left > 0:
-        await ctx.send(f"🕒 Wait {int(left//3600)}h {int((left%3600)//60)}m for your daily reward.")
+        await ctx.send(f"🕒 You must wait {int(left // 60)}m {int(left % 60)}s for your daily reward.")
         return
     reward = random.randint(1500, 3500)
-    data[uid]["bal"] += reward
-    data[uid]["daily"] = datetime.utcnow().isoformat()
-    add_exp(data[uid], 60)
-    add_coins_earned_today(data[uid], reward)
+    user["bal"] += reward
+    user["daily"] = datetime.utcnow().isoformat()
+    add_exp(user, 60)
+    earned_achievements = update_achievements(data, uid)
     save_data(data)
-    await ctx.send(f"✅ Daily collected: +{reward} coins, +60 EXP")
+    msg = f"✅ You collected your daily reward: +{reward:,} coins, +60 EXP"
+    for key, desc, rew in earned_achievements:
+        msg += f"\n🏆 Achievement unlocked: {desc} (+{rew:,} coins)"
+    await ctx.send(msg)
 
 @bot.command()
 async def work(ctx):
@@ -187,27 +204,27 @@ async def work(ctx):
     uid = str(ctx.author.id)
     ensure_user(data, uid)
     user = data[uid]
-    base_cd = WORK_COOLDOWN
-    # reduce cooldown by 5 mins per booster owned
-    booster_reduction = user.get("work_booster", 0) * 300
-    cd = max(60, base_cd - booster_reduction)
-    left = cooldown_left(user["work"], cd)
+    cooldown = get_work_cooldown(user)
+    left = cooldown_left(user["work"], cooldown)
     if left > 0:
-        await ctx.send(f"🕒 Wait {int(left//60)}m {int(left%60)}s before working again.")
+        await ctx.send(f"🕒 You need to wait {int(left // 60)}m {int(left % 60)}s before working again.")
         return
-    # Base reward with job bonus
-    base_reward = random.randint(1100, 2500)
-    job_bonus = 0
-    if user["job"]:
-        job_bonus = JOBS[user["job"]]["base_income"] * (0.1 * (user["job_lvl"] - 1))
-    total_reward = int(base_reward + job_bonus)
-    user["bal"] += total_reward
+    # Calculate pay based on job and level
+    base_pay = random.randint(1100, 2500)
+    job_mult = 1.0
+    if user["job"] in JOBS:
+        job_mult = JOBS[user["job"]]["base_pay"] + (user["job_lvl"] - 1) * 0.1
+    pay = int(base_pay * job_mult)
+    user["bal"] += pay
     user["work"] = datetime.utcnow().isoformat()
     add_exp(user, 45)
-    add_coins_earned_today(user, total_reward)
-    user["work_done"] = user.get("work_done", 0) + 1
+    add_job_exp(user, 30)
+    earned_achievements = update_achievements(data, uid)
     save_data(data)
-    await ctx.send(f"💼 Worked and earned {total_reward} coins (+{int(45)} EXP)")
+    msg = f"💼 You worked as {user['job'] or 'a freelancer'} and earned {pay:,} coins, +45 EXP"
+    for key, desc, rew in earned_achievements:
+        msg += f"\n🏆 Achievement unlocked: {desc} (+{rew:,} coins)"
+    await ctx.send(msg)
 
 @bot.command()
 async def inv(ctx):
@@ -215,17 +232,38 @@ async def inv(ctx):
     uid = str(ctx.author.id)
     ensure_user(data, uid)
     inv = data[uid]["inv"]
-    boosters = data[uid].get("work_booster", 0)
-    msg = "**🎒 Inventory:**\n"
-    if not inv and boosters == 0:
-        await ctx.send("Your inventory is empty.")
+    if not inv or all(v <= 0 for v in inv.values()):
+        await ctx.send("🎒 Your inventory is empty.")
         return
+    msg = "**🎒 Inventory:**\n"
     for item, amount in inv.items():
         if amount > 0:
             msg += f"{item} x{amount}\n"
-    if boosters > 0:
-        msg += f"Work Boosters x{boosters}\n"
     await ctx.send(msg)
+
+@bot.command()
+async def job(ctx, job_name: str = None):
+    data = load_data()
+    uid = str(ctx.author.id)
+    ensure_user(data, uid)
+    user = data[uid]
+    if job_name is None:
+        if user["job"]:
+            await ctx.send(f"👔 Your current job: {user['job']} {JOBS[user['job']]['emoji']} Lv.{user['job_lvl']}")
+        else:
+            await ctx.send(f"ℹ️ You don't have a job. Choose one with `!job <hacker/trader/miner>`")
+        return
+    job_name = job_name.lower()
+    if job_name not in JOBS:
+        await ctx.send("❌ Invalid job. Choose from: hacker, trader, miner.")
+        return
+    user["job"] = job_name
+    user["job_lvl"] = 1
+    user["job_exp"] = 0
+    save_data(data)
+    await ctx.send(f"✅ You started working as a {job_name} {JOBS[job_name]['emoji']}")
+
+# ------------- Shop with buying multiple amounts -----------------
 
 @bot.command()
 async def shop(ctx):
@@ -233,384 +271,385 @@ async def shop(ctx):
     for crypto, info in CRYPTOCURRENCIES.items():
         price_str = f"{info['price']:,}" if info['price'] >= 1 else str(info['price'])
         msg += f"`{crypto}`: {price_str} coins — {info['desc']}\n"
+    msg += "\nUse `!buy <crypto> <amount>` to purchase multiple."
     await ctx.send(msg)
 
-# Buy command supporting amount
 @bot.command()
 async def buy(ctx, item: str, amount: int = 1):
+    if amount <= 0:
+        await ctx.send("❌ Amount must be a positive number.")
+        return
     data = load_data()
     uid = str(ctx.author.id)
     item = item.lower()
     ensure_user(data, uid)
-    user = data[uid]
     if item not in CRYPTOCURRENCIES:
         await ctx.send("❌ That crypto is not available in the shop.")
         return
-    if amount < 1:
-        await ctx.send("❌ You must buy at least 1 item.")
+    cost = int(CRYPTOCURRENCIES[item]["price"] * amount)
+    if data[uid]["bal"] < cost:
+        await ctx.send(f"❌ You don't have enough coins to buy {amount} {item}(s) ({cost:,} coins).")
         return
-    cost_per = CRYPTOCURRENCIES[item]["price"]
-    total_cost = int(cost_per * amount)
-    if user["bal"] < total_cost:
-        await ctx.send(f"❌ Not enough coins to buy {amount} {item} ({total_cost} coins).")
-        return
-    user["bal"] -= total_cost
-    inv = user["inv"]
+    data[uid]["bal"] -= cost
+    inv = data[uid]["inv"]
     inv[item] = inv.get(item, 0) + amount
-    add_exp(user, 20 * amount)
-    add_coins_earned_today(user, total_cost)
+    add_exp(data[uid], 20 * amount)
     save_data(data)
-    await ctx.send(f"✅ Bought {amount} {item} for {total_cost} coins.")
+    await ctx.send(f"✅ You bought {amount} {item}(s) for {cost:,} coins.")
 
 @bot.command()
 async def sell(ctx, item: str, amount: int = 1):
+    if amount <= 0:
+        await ctx.send("❌ Amount must be a positive number.")
+        return
     data = load_data()
     uid = str(ctx.author.id)
     item = item.lower()
     ensure_user(data, uid)
-    user = data[uid]
-    inv = user["inv"]
-    if item not in inv or inv[item] < amount or amount < 1:
-        await ctx.send("❌ You don't have enough of this item to sell.")
+    inv = data[uid]["inv"]
+    if item not in inv or inv[item] < amount:
+        await ctx.send("❌ You don't own that many items to sell.")
         return
-    price = int(CRYPTOCURRENCIES.get(item, {"price":0})["price"] * 0.6)
-    total_price = price * amount
+    price = int(CRYPTOCURRENCIES.get(item, {"price":0})["price"] * 0.6 * amount)
     inv[item] -= amount
-    user["bal"] += total_price
+    data[uid]["bal"] += price
     save_data(data)
-    await ctx.send(f"✅ Sold {amount} {item} for {total_price} coins.")
+    await ctx.send(f"✅ You sold {amount} {item}(s) for {price:,} coins.")
 
-# Lootbox command (random rewards)
+# -------- Lootbox command --------
+
 @bot.command()
 async def lootbox(ctx):
     data = load_data()
     uid = str(ctx.author.id)
     ensure_user(data, uid)
     user = data[uid]
+    cost = 5000
+    if user["bal"] < cost:
+        await ctx.send(f"❌ You need {cost:,} coins to buy a lootbox.")
+        return
+    user["bal"] -= cost
 
-    rewards = [
-        {"type": "crypto", "item": random.choice(list(CRYPTOCURRENCIES.keys())), "amount": random.randint(1,3)},
-        {"type": "work_booster", "amount": 1},
-        {"type": "coins", "amount": random.randint(500, 1500)},
-    ]
-    reward = random.choice(rewards)
+    # Randomly pick lootbox item
+    loot = random.choice(LOOTBOX_ITEMS)
+    if loot["type"] == "crypto":
+        amount = random.randint(loot["min"], loot["max"])
+        user["inv"][loot["item"]] = user["inv"].get(loot["item"], 0) + amount
+        msg = f"🎁 You opened a lootbox and got {amount} {loot['item']}!"
+    else:  # booster
+        add_booster(user, loot["item"], loot["duration"])
+        msg = f"🎁 You opened a lootbox and got a **{loot['item']}** booster active for {loot['duration']//60} minutes!"
 
-    if reward["type"] == "crypto":
-        item = reward["item"]
-        amt = reward["amount"]
-        user["inv"][item] = user["inv"].get(item, 0) + amt
-        msg = f"🎁 Lootbox reward: {amt} {item} crypto!"
-    elif reward["type"] == "work_booster":
-        user["work_booster"] = user.get("work_booster", 0) + 1
-        msg = "🎁 Lootbox reward: Work Booster! (reduces work cooldown)"
-    else:
-        coins = reward["amount"]
-        user["bal"] += coins
-        add_coins_earned_today(user, coins)
-        msg = f"🎁 Lootbox reward: {coins} coins!"
-
+    add_exp(user, 50)
     save_data(data)
     await ctx.send(msg)
 
-# Rob command with cooldown and risk
+# -------- Work cooldown boosters info --------
+
+@bot.command()
+async def boosters(ctx):
+    data = load_data()
+    uid = str(ctx.author.id)
+    ensure_user(data, uid)
+    user = data[uid]
+    msg = "**🎁 Your Active Boosters:**\n"
+    now = datetime.utcnow()
+    active = False
+    for booster, expiry_str in user.get("boosters", {}).items():
+        expiry = datetime.fromisoformat(expiry_str)
+        if expiry > now:
+            active = True
+            remaining = expiry - now
+            m, s = divmod(int(remaining.total_seconds()), 60)
+            msg += f"{booster}: {m}m {s}s remaining\n"
+    if not active:
+        msg += "None"
+    await ctx.send(msg)
+
+# -------- Robbery system --------
+
 @bot.command()
 async def rob(ctx, target: discord.Member):
+    if target.bot:
+        await ctx.send("❌ You can't rob bots.")
+        return
+    if target == ctx.author:
+        await ctx.send("❌ You can't rob yourself.")
+        return
     data = load_data()
     uid = str(ctx.author.id)
     tid = str(target.id)
     ensure_user(data, uid)
     ensure_user(data, tid)
+
     user = data[uid]
     target_user = data[tid]
 
-    if uid == tid:
-        await ctx.send("❌ You can't rob yourself.")
-        return
-
-    left = cooldown_left(user["rob"], ROB_COOLDOWN)
+    cooldown_key = "rob"
+    left = cooldown_left(user["cooldowns"].get(cooldown_key), 1800)  # 30 min cooldown
     if left > 0:
-        await ctx.send(f"🕒 Wait {int(left//60)}m {int(left%60)}s before robbing again.")
+        await ctx.send(f"🕒 You must wait {int(left // 60)}m {int(left % 60)}s before robbing again.")
         return
 
-    if target_user["bal"] < 500:
-        await ctx.send("❌ Target doesn't have enough coins to rob.")
+    if target_user["bal"] < 100:
+        await ctx.send("❌ Target doesn't have enough money to rob.")
         return
 
-    success = random.random() < 0.5
-    if success:
-        steal_amount = random.randint(100, int(target_user["bal"] * 0.3))
+    success_chance = 0.4
+    if random.random() < success_chance:
+        # Rob success: steal 10-30% of target's balance
+        steal_amount = int(target_user["bal"] * random.uniform(0.1, 0.3))
+        steal_amount = max(50, steal_amount)
         steal_amount = min(steal_amount, target_user["bal"])
         target_user["bal"] -= steal_amount
         user["bal"] += steal_amount
-        await ctx.send(f"💰 You successfully robbed {steal_amount} coins from {target.display_name}!")
+        user["cooldowns"][cooldown_key] = datetime.utcnow().isoformat()
+        save_data(data)
+        await ctx.send(f"💰 You robbed {target.display_name} and stole {steal_amount:,} coins!")
     else:
-        penalty = random.randint(50, 200)
-        user["bal"] = max(0, user["bal"] - penalty)
-        await ctx.send(f"🚨 Robbery failed! You lost {penalty} coins as penalty.")
+        # Rob fail: lose some money as penalty
+        penalty = random.randint(100, 300)
+        penalty = min(penalty, user["bal"])
+        user["bal"] -= penalty
+        user["cooldowns"][cooldown_key] = datetime.utcnow().isoformat()
+        save_data(data)
+        await ctx.send(f"❌ You got caught trying to rob {target.display_name}! You paid a penalty of {penalty:,} coins.")
 
-    user["rob"] = datetime.utcnow().isoformat()
-    save_data(data)
+# -------- Gambling: coinflip --------
 
-# Slots gambling game
 @bot.command()
-async def slots(ctx, amount: int):
-    if amount <= 0 or amount > MAX_BET:
-        await ctx.send(f"❌ Bet must be between 1 and {MAX_BET}.")
+async def coinflip(ctx, bet: int, guess: str):
+    guess = guess.lower()
+    if bet <= 0 or bet > MAX_BET:
+        await ctx.send(f"❌ Bet must be positive and at most {MAX_BET:,} coins.")
         return
-
+    if guess not in ["heads", "tails"]:
+        await ctx.send("❌ Guess must be 'heads' or 'tails'.")
+        return
     data = load_data()
     uid = str(ctx.author.id)
     ensure_user(data, uid)
     user = data[uid]
-
-    if user["bal"] < amount:
-        await ctx.send("❌ Not enough coins for that bet.")
+    if user["bal"] < bet:
+        await ctx.send("❌ You don't have enough coins for that bet.")
         return
+    flip = random.choice(["heads", "tails"])
+    if flip == guess:
+        win = bet * 2
+        user["bal"] += bet
+        add_exp(user, 25)
+        await ctx.send(f"🎉 You won! The coin landed on {flip}. You gained {bet:,} coins.")
+    else:
+        user["bal"] -= bet
+        await ctx.send(f"😢 You lost! The coin landed on {flip}. You lost {bet:,} coins.")
+    save_data(data)
 
-    emojis = ["🍒", "🍋", "🔔", "⭐", "7️⃣"]
-    result = [random.choice(emojis) for _ in range(3)]
+# -------- Gambling: slots --------
 
-    win = 0
+@bot.command()
+async def slots(ctx, bet: int):
+    if bet <= 0 or bet > MAX_BET:
+        await ctx.send(f"❌ Bet must be positive and at most {MAX_BET:,} coins.")
+        return
+    data = load_data()
+    uid = str(ctx.author.id)
+    ensure_user(data, uid)
+    user = data[uid]
+    if user["bal"] < bet:
+        await ctx.send("❌ You don't have enough coins for that bet.")
+        return
+    symbols = ["🍒", "🍋", "🍊", "💎", "7️⃣"]
+    result = [random.choice(symbols) for _ in range(3)]
+    user["bal"] -= bet
     if result[0] == result[1] == result[2]:
-        win = amount * 5
-    elif result[0] == result[1] or result[1] == result[2] or result[0] == result[2]:
-        win = amount * 2
+        payout = bet * 5
+        user["bal"] += payout
+        add_exp(user, 50)
+        await ctx.send(f"🎰 {' | '.join(result)}\nJackpot! You won {payout:,} coins!")
+    elif len(set(result)) == 2:  # two symbols match
+        payout = bet * 2
+        user["bal"] += payout
+        add_exp(user, 20)
+        await ctx.send(f"🎰 {' | '.join(result)}\nNice! Two match. You won {payout:,} coins!")
+    else:
+        await ctx.send(f"🎰 {' | '.join(result)}\nNo luck this time. You lost {bet:,} coins.")
+    save_data(data)
 
-    if win > 0:
-        user["bal"] += win
+# -------- Gambling: cups (reaction buttons) --------
+# For simplicity, will use text command cups with 3 cups and user picks a cup number 1-3
+
+@bot.command()
+async def cups(ctx, bet: int, choice: int):
+    if bet <= 0 or bet > MAX_BET:
+        await ctx.send(f"❌ Bet must be positive and at most {MAX_BET:,} coins.")
+        return
+    if choice not in [1, 2, 3]:
+        await ctx.send("❌ Choose a cup number between 1 and 3.")
+        return
+    data = load_data()
+    uid = str(ctx.author.id)
+    ensure_user(data, uid)
+    user = data[uid]
+    if user["bal"] < bet:
+        await ctx.send("❌ You don't have enough coins for that bet.")
+        return
+    user["bal"] -= bet
+    winning_cup = random.randint(1, 3)
+    if choice == winning_cup:
+        payout = bet * 3
+        user["bal"] += payout
         add_exp(user, 40)
-        await ctx.send(f"🎰 {' | '.join(result)}\n🎉 You won {win} coins!")
+        await ctx.send(f"🥤 You picked cup {choice}, and it was correct! You won {payout:,} coins.")
     else:
-        user["bal"] -= amount
-        add_exp(user, 10)
-        await ctx.send(f"🎰 {' | '.join(result)}\n💀 You lost {amount} coins.")
-
+        await ctx.send(f"🥤 You picked cup {choice}, but the prize was under cup {winning_cup}. You lost {bet:,} coins.")
     save_data(data)
 
-# Coin investment commands
+# -------- Achievements --------
+
 @bot.command()
-async def invest(ctx, action: str, crypto: str = None, amount: int = 0):
+async def achievements(ctx):
     data = load_data()
     uid = str(ctx.author.id)
     ensure_user(data, uid)
     user = data[uid]
-    action = action.lower()
+    if not user["achievements"]:
+        await ctx.send("🏆 You have no achievements yet. Keep playing!")
+        return
+    msg = "**🏆 Your Achievements:**\n"
+    for key in user["achievements"]:
+        msg += f"- {ACHIEVEMENTS[key]['desc']}\n"
+    await ctx.send(msg)
 
-    if action == "buy":
-        if crypto is None or amount <= 0:
-            await ctx.send("Usage: !invest buy <crypto> <amount>")
-            return
-        crypto = crypto.lower()
-        if crypto not in CRYPTOCURRENCIES:
-            await ctx.send("Crypto not found.")
-            return
-        cost = CRYPTOCURRENCIES[crypto]["price"] * amount
-        if user["bal"] < cost:
-            await ctx.send("Not enough coins.")
-            return
-        user["bal"] -= int(cost)
-        user["investments"][crypto] = user["investments"].get(crypto, 0) + amount
+# -------- Daily quests (simple and rewarding) --------
+
+@bot.command()
+async def quest(ctx):
+    data = load_data()
+    uid = str(ctx.author.id)
+    ensure_user(data, uid)
+    user = data[uid]
+    if user["daily_quests"]["claimed"]:
+        await ctx.send("✅ You already claimed your daily quest rewards. New quests come tomorrow.")
+        return
+    # If no quests or all completed, generate new quests
+    if not user["daily_quests"]["quests"]:
+        quests = [
+            {"task": "work", "desc": "Work once", "done": False, "reward": 800},
+            {"task": "rob", "desc": "Rob a player once", "done": False, "reward": 1200},
+            {"task": "gamble", "desc": "Win 1 gamble game", "done": False, "reward": 1000},
+        ]
+        user["daily_quests"]["quests"] = quests
+        user["daily_quests"]["claimed"] = False
         save_data(data)
-        await ctx.send(f"Bought {amount} {crypto} at {CRYPTOCURRENCIES[crypto]['price']} coins each.")
+    msg = "**🎯 Daily Quests:**\n"
+    for i, q in enumerate(user["daily_quests"]["quests"], 1):
+        status = "✅" if q["done"] else "❌"
+        msg += f"{i}. {q['desc']} {status}\n"
+    msg += "\nComplete quests and use `!claim` to get rewards."
+    await ctx.send(msg)
 
-    elif action == "sell":
-        if crypto is None or amount <= 0:
-            await ctx.send("Usage: !invest sell <crypto> <amount>")
-            return
-        crypto = crypto.lower()
-        if crypto not in user["investments"] or user["investments"][crypto] < amount:
-            await ctx.send("Not enough invested coins.")
-            return
-        price = CRYPTOCURRENCIES[crypto]["price"]
-        gain = price * amount
-        user["investments"][crypto] -= amount
-        if user["investments"][crypto] == 0:
-            del user["investments"][crypto]
-        user["bal"] += int(gain)
-        save_data(data)
-        await ctx.send(f"Sold {amount} {crypto} at {price} coins each for {int(gain)} coins.")
-
-    elif action == "portfolio":
-        if not user["investments"]:
-            await ctx.send("Your investment portfolio is empty.")
-            return
-        msg = "**📈 Your Investments:**\n"
-        total_val = 0
-        for c, amt in user["investments"].items():
-            price = CRYPTOCURRENCIES[c]["price"]
-            val = price * amt
-            total_val += val
-            msg += f"{c}: {amt} coins, worth {val:.2f} coins\n"
-        msg += f"Total portfolio value: {total_val:.2f} coins"
-        await ctx.send(msg)
-
-    else:
-        await ctx.send("Invalid invest command. Use buy/sell/portfolio.")
-
-# Jobs commands
 @bot.command()
-async def job(ctx, jobname=None):
+async def claim(ctx):
     data = load_data()
     uid = str(ctx.author.id)
     ensure_user(data, uid)
     user = data[uid]
-
-    if jobname is None:
-        # Show current job or options
-        msg = f"Your current job: {user['job'] or 'None'} (Level {user['job_lvl']})\nAvailable jobs:\n"
-        for j, info in JOBS.items():
-            msg += f"{j} {info['emoji']} - Base income: {info['base_income']} coins/work\n"
-        await ctx.send(msg)
+    if user["daily_quests"]["claimed"]:
+        await ctx.send("❌ You already claimed your daily quests rewards.")
         return
-
-    jobname = jobname.lower()
-    if jobname not in JOBS:
-        await ctx.send("Job not found.")
+    total_reward = 0
+    for q in user["daily_quests"]["quests"]:
+        if q["done"]:
+            total_reward += q["reward"]
+    if total_reward == 0:
+        await ctx.send("❌ You haven't completed any quests yet.")
         return
-
-    user["job"] = jobname
-    user["job_lvl"] = 1
+    user["bal"] += total_reward
+    user["daily_quests"]["claimed"] = True
     save_data(data)
-    await ctx.send(f"✅ You are now a {jobname} {JOBS[jobname]['emoji']}")
+    await ctx.send(f"🎉 You claimed {total_reward:,} coins from your daily quests!")
+
+# You can add hooks or triggers on certain commands to mark quests as done, e.g. on work, rob, gamble commands,
+# but for simplicity, user must manually mark them or it can be extended later.
+
+# -------- Admin commands --------
 
 @bot.command()
-async def joblvlup(ctx):
-    data = load_data()
-    uid = str(ctx.author.id)
-    ensure_user(data, uid)
-    user = data[uid]
-    if not user["job"]:
-        await ctx.send("You don't have a job.")
-        return
-    cost = user["job_lvl"] * 10000
-    if user["bal"] < cost:
-        await ctx.send(f"You need {cost} coins to level up your job.")
-        return
-    user["bal"] -= cost
-    user["job_lvl"] += 1
-    save_data(data)
-    await ctx.send(f"Job level increased to {user['job_lvl']}! Income increased.")
-
-# Daily quests command
-@bot.command()
-async def dailyquest(ctx):
-    data = load_data()
-    uid = str(ctx.author.id)
-    ensure_user(data, uid)
-    user = data[uid]
-    if user.get("daily_quest_completed", False):
-        await ctx.send("You already completed today's daily quest.")
-        return
-    for quest in DAILY_QUESTS:
-        if quest["check"](user):
-            user["exp"] += quest["reward_exp"]
-            user["bal"] += quest["reward_coins"]
-            user["daily_quest_completed"] = True
-            save_data(data)
-            await ctx.send(f"✅ Daily quest completed: {quest['desc']}! You got {quest['reward_exp']} EXP and {quest['reward_coins']} coins.")
-            return
-    await ctx.send("You haven't completed any daily quests yet. Keep playing!")
-
-# Admin commands (only owner)
-def is_owner():
-    async def predicate(ctx):
-        return await bot.is_owner(ctx.author)
-    return commands.check(predicate)
-
-@bot.command()
-@is_owner()
-async def reset(ctx, user: discord.Member = None):
+@commands.is_owner()
+async def resetdata(ctx, user: discord.User = None):
     data = load_data()
     if user:
         uid = str(user.id)
         if uid in data:
             del data[uid]
             save_data(data)
-            await ctx.send(f"Reset data for {user.display_name}.")
+            await ctx.send(f"✅ Data for {user} reset.")
         else:
-            await ctx.send("User data not found.")
+            await ctx.send("❌ User data not found.")
     else:
-        data.clear()
-        save_data(data)
-        await ctx.send("Reset all user data.")
+        # Reset all data (careful!)
+        save_data({})
+        await ctx.send("✅ All data reset.")
 
 @bot.command()
-@is_owner()
-async def resetcd(ctx, user: discord.Member = None):
+@commands.is_owner()
+async def resetcd(ctx, user: discord.User = None):
     data = load_data()
     if user:
         uid = str(user.id)
         if uid in data:
-            userd = data[uid]
-            userd["work"] = None
-            userd["rob"] = None
-            userd["daily"] = None
+            data[uid]["cooldowns"] = {}
             save_data(data)
-            await ctx.send(f"Cooldowns reset for {user.display_name}.")
+            await ctx.send(f"✅ Cooldowns reset for {user}.")
         else:
-            await ctx.send("User data not found.")
+            await ctx.send("❌ User data not found.")
     else:
-        for u in data.values():
-            u["work"] = None
-            u["rob"] = None
-            u["daily"] = None
+        # Reset cooldowns for all users
+        for uid in data:
+            data[uid]["cooldowns"] = {}
         save_data(data)
-        await ctx.send("All cooldowns reset.")
+        await ctx.send("✅ All cooldowns reset.")
 
-@bot.command()
-@is_owner()
-async def givexp(ctx, user: discord.Member, amount: int):
-    data = load_data()
-    uid = str(user.id)
-    ensure_user(data, uid)
-    data[uid]["exp"] += amount
-    save_data(data)
-    await ctx.send(f"Gave {amount} EXP to {user.display_name}.")
+# -------------- Help command --------------
 
-# Help command override - to avoid conflicts with default
 @bot.command(name="help")
 async def help_cmd(ctx):
-    msg = """
-**Available Commands:**
-`!bal` - Check your balance and level
-`!daily` - Collect daily coins
-`!work` - Work to earn coins
-`!inv` - Check your inventory
-`!shop` - Show crypto shop
-`!buy <crypto> [amount]` - Buy cryptos
-`!sell <crypto> [amount]` - Sell cryptos
-`!lootbox` - Open a lootbox with random rewards
-`!rob @user` - Rob another user (30m cooldown)
-`!slots <amount>` - Play slot machine gambling
-`!invest buy/sell/portfolio` - Manage crypto investments
-`!job [jobname]` - Choose or check job
-`!joblvlup` - Level up your job (cost coins)
-`!dailyquest` - Complete daily quests for rewards
+    msg = """**📚 Bot Commands:**
 
-(Admin only commands available)
+**Economy:**
+`!bal` - Check your balance and level
+`!daily` - Claim daily reward (cooldown)
+`!work` - Work for coins (cooldown, can be boosted)
+`!inv` - Show your inventory
+`!job [job]` - Choose/view your job (hacker, trader, miner)
+`!shop` - View crypto shop
+`!buy <crypto> <amount>` - Buy crypto
+`!sell <crypto> <amount>` - Sell crypto
+
+**Gambling (max bet 250,000):**
+`!coinflip <bet> <heads/tails>`
+`!slots <bet>`
+`!cups <bet> <cup number (1-3)>`
+
+**Other:**
+`!lootbox` - Buy and open a lootbox for random rewards (cost 5000 coins)
+`!boosters` - Show your active boosters
+`!rob <user>` - Attempt to rob another user (30 min cooldown)
+`!achievements` - View your achievements
+`!quest` - View daily quests
+`!claim` - Claim daily quests rewards
+
+**Admin (owner only):**
+`!resetdata [@user]` - Reset user or all data
+`!resetcd [@user]` - Reset cooldowns for user or all
 
 """
     await ctx.send(msg)
 
-# Reset daily quest status daily at midnight UTC
-@tasks.loop(hours=24)
-async def reset_daily_quests():
-    data = load_data()
-    for user in data.values():
-        user["daily_quest_completed"] = False
-        user["coins_earned_today"] = 0
-        user["exp_gained_today"] = 0
-    save_data(data)
+# ------------- Run bot -------------
 
-# Start the daily quest reset task at midnight UTC
-from datetime import time, timezone
-
-@bot.event
-async def on_connect():
-    now = datetime.utcnow()
-    target = datetime.combine(now.date(), time.min).replace(tzinfo=None) + timedelta(days=1)
-    delay = (target - now).total_seconds()
-    await asyncio.sleep(delay)
-    reset_daily_quests.start()
-
-bot.run(os.getenv("DISCORD_TOKEN"))
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+if not TOKEN:
+    print("ERROR: DISCORD_BOT_TOKEN env variable not set!")
+else:
+    bot.run(TOKEN)
