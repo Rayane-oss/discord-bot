@@ -3,25 +3,25 @@ from discord.ext import commands, tasks
 import os, random, json
 from datetime import datetime, timedelta
 
-bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 DATA_FILE = "economy.json"
 MAX_BET = 250_000
-COOLDOWN_SEC = 2400  # 40 minutes cooldown
+CD_SECONDS = 2400  # 40 minutes cooldown
 
-# Initial crypto coins with base prices
+# Initial crypto coins for shop
 CRYPTOS = {
-    "BTC": 30000,
-    "ETH": 2000,
-    "SOL": 30,
-    "ADA": 1,
-    "DOGE": 0.1,
-    "MATIC": 1.5,
+    "BTC": 20000,
+    "ETH": 1500,
+    "DOGE": 0.06,
+    "ADA": 0.45,
+    "SOL": 22,
 }
 
 def load_data():
     try:
-        with open(DATA_FILE) as f:
+        with open(DATA_FILE, "r") as f:
             return json.load(f)
     except:
         return {}
@@ -38,160 +38,160 @@ def ensure_user(data, uid):
             "lvl": 1,
             "daily": None,
             "work": None,
-            "inv": {},
+            "inv": {}
         }
 
-def cooldown_left(last_time):
+def cd_left(last_time):
     if not last_time:
         return 0
     diff = (datetime.utcnow() - datetime.fromisoformat(last_time)).total_seconds()
-    return max(0, COOLDOWN_SEC - diff)
+    return max(0, CD_SECONDS - diff)
 
-def add_exp(user, amount):
-    user["exp"] += amount
-    while user["exp"] >= 1000:
-        user["exp"] -= 1000
-        user["lvl"] += 1
+def add_exp(user_data, amount):
+    user_data["exp"] += amount
+    while user_data["exp"] >= 1000:
+        user_data["exp"] -= 1000
+        user_data["lvl"] += 1
 
-# Prices dict updated every hour, start as copy of CRYPTOS base prices
-prices = CRYPTOS.copy()
+def update_crypto_prices():
+    for k in CRYPTOS:
+        base = CRYPTOS[k]
+        change = random.uniform(-0.05, 0.07)  # -5% to +7%
+        new_price = base * (1 + change)
+        CRYPTOS[k] = round(max(new_price, 0.01), 2)
 
 @tasks.loop(hours=1)
-async def update_crypto_prices():
-    global prices
-    for coin in prices:
-        base = CRYPTOS[coin]
-        # fluctuate by ±10%
-        change_percent = random.uniform(-0.1, 0.1)
-        new_price = max(0.01, base * (1 + change_percent))
-        prices[coin] = round(new_price, 2)
-    print("Crypto prices updated:", prices)
+async def hourly_price_update():
+    update_crypto_prices()
+    print("Crypto prices updated:", CRYPTOS)
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} - Ready!")
-    update_crypto_prices.start()
+    hourly_price_update.start()
 
 @bot.command()
 async def ping(ctx):
     await ctx.send("🏓 Pong!")
 
-@bot.command(name="bal")
+@bot.command(aliases=["bal"])
 async def balance(ctx):
     data = load_data()
     uid = str(ctx.author.id)
     ensure_user(data, uid)
-    user = data[uid]
-    await ctx.send(f"💰 Balance: {user['bal']} | Level: {user['lvl']} | EXP: {user['exp']}/1000")
+    u = data[uid]
+    await ctx.send(f"💰 Balance: {u['bal']} | Level: {u['lvl']} | EXP: {u['exp']}/1000")
 
 @bot.command()
 async def daily(ctx):
     data = load_data()
     uid = str(ctx.author.id)
     ensure_user(data, uid)
-    left = cooldown_left(data[uid]["daily"])
+    left = cd_left(data[uid]["daily"])
     if left > 0:
-        await ctx.send(f"🕒 Wait {int(left//60)}m {int(left%60)}s for your daily reward.")
+        await ctx.send(f"⏳ Wait {int(left//60)}m {int(left%60)}s for daily.")
         return
     reward = random.randint(1500, 3500)
     data[uid]["bal"] += reward
     data[uid]["daily"] = datetime.utcnow().isoformat()
     add_exp(data[uid], 60)
     save_data(data)
-    await ctx.send(f"✅ You received your daily {reward} coins and 60 EXP!")
+    await ctx.send(f"✅ Daily claimed: +{reward} coins, +60 EXP")
 
 @bot.command()
 async def work(ctx):
     data = load_data()
     uid = str(ctx.author.id)
     ensure_user(data, uid)
-    left = cooldown_left(data[uid]["work"])
+    left = cd_left(data[uid]["work"])
     if left > 0:
-        await ctx.send(f"🕒 Wait {int(left//60)}m {int(left%60)}s before working again.")
+        await ctx.send(f"⏳ Wait {int(left//60)}m {int(left%60)}s before working again.")
         return
     reward = random.randint(1100, 2500)
     data[uid]["bal"] += reward
     data[uid]["work"] = datetime.utcnow().isoformat()
     add_exp(data[uid], 45)
     save_data(data)
-    await ctx.send(f"💼 You worked and earned {reward} coins and 45 EXP!")
+    await ctx.send(f"💼 Work done: +{reward} coins, +45 EXP")
 
 @bot.command()
 async def shop(ctx):
     msg = "**🪙 Crypto Shop (prices update hourly):**\n"
-    for coin, price in prices.items():
-        msg += f"`{coin}` : {price} coins\n"
+    for coin, price in CRYPTOS.items():
+        msg += f"`{coin}`: {price} coins\n"
     await ctx.send(msg)
 
 @bot.command()
-async def buy(ctx, coin: str, qty: int):
+async def buy(ctx, coin: str, qty: int = 1):
     data = load_data()
     uid = str(ctx.author.id)
-    ensure_user(data, uid)
     coin = coin.upper()
-    if coin not in prices:
-        await ctx.send("❌ That cryptocurrency is not available.")
+    ensure_user(data, uid)
+    if coin not in CRYPTOS:
+        await ctx.send("❌ Crypto not found.")
         return
-    if qty <= 0:
-        await ctx.send("❌ Quantity must be positive.")
+    cost = int(CRYPTOS[coin] * qty)
+    if qty < 1:
+        await ctx.send("❌ Quantity must be at least 1.")
         return
-    cost = prices[coin] * qty
     if data[uid]["bal"] < cost:
-        await ctx.send(f"❌ You need {cost} coins but only have {data[uid]['bal']}.")
+        await ctx.send(f"❌ Not enough coins. Need {cost}, you have {data[uid]['bal']}.")
         return
-    data[uid]["bal"] -= cost
     inv = data[uid]["inv"]
     inv[coin] = inv.get(coin, 0) + qty
+    data[uid]["bal"] -= cost
     add_exp(data[uid], 20 * qty)
     save_data(data)
-    await ctx.send(f"✅ You bought {qty} {coin} for {cost} coins.")
+    await ctx.send(f"✅ Bought {qty} {coin} for {cost} coins.")
 
 @bot.command()
-async def sell(ctx, coin: str, qty: int):
+async def sell(ctx, coin: str, qty: int = 1):
     data = load_data()
     uid = str(ctx.author.id)
-    ensure_user(data, uid)
     coin = coin.upper()
+    ensure_user(data, uid)
     inv = data[uid]["inv"]
-    if coin not in inv or inv[coin] < qty or qty <= 0:
-        await ctx.send("❌ You don't have enough of that coin.")
+    if coin not in inv or inv[coin] < qty or qty < 1:
+        await ctx.send("❌ You don't have enough of that crypto.")
         return
-    price = prices[coin] * qty * 0.6  # 60% sellback price
+    price = int(CRYPTOS[coin] * qty * 0.6)
     inv[coin] -= qty
-    if inv[coin] == 0:
+    if inv[coin] <= 0:
         del inv[coin]
-    data[uid]["bal"] += int(price)
+    data[uid]["bal"] += price
     save_data(data)
-    await ctx.send(f"✅ Sold {qty} {coin} for {int(price)} coins.")
+    await ctx.send(f"✅ Sold {qty} {coin} for {price} coins.")
 
-@bot.command(name="inv")
+@bot.command(aliases=["inv"])
 async def inventory(ctx):
     data = load_data()
     uid = str(ctx.author.id)
     ensure_user(data, uid)
     inv = data[uid]["inv"]
     if not inv:
-        await ctx.send("🎒 Your inventory is empty.")
+        await ctx.send("🎒 Inventory empty.")
         return
-    msg = "**🎒 Inventory:**\n"
-    for coin, qty in inv.items():
-        msg += f"{coin} x{qty}\n"
+    msg = "**🎒 Your Inventory:**\n"
+    for c, q in inv.items():
+        msg += f"{c} x{q}\n"
     await ctx.send(msg)
 
-@bot.command(name="cf")
+# --------- Gambling Commands ---------
+
+@bot.command(aliases=["cf"])
 async def coinflip(ctx, amount: int, guess: str):
     data = load_data()
     uid = str(ctx.author.id)
     ensure_user(data, uid)
     guess = guess.lower()
     if guess not in ["heads", "tails"]:
-        await ctx.send("❌ Guess must be 'heads' or 'tails'.")
+        await ctx.send("❌ Guess heads or tails.")
         return
-    if amount <= 0 or amount > MAX_BET:
-        await ctx.send(f"❌ Bet amount must be between 1 and {MAX_BET}.")
+    if amount < 1 or amount > MAX_BET:
+        await ctx.send(f"❌ Bet must be between 1 and {MAX_BET}.")
         return
     if data[uid]["bal"] < amount:
-        await ctx.send("❌ You don't have enough coins.")
+        await ctx.send("❌ Not enough coins.")
         return
     result = random.choice(["heads", "tails"])
     if guess == result:
@@ -205,13 +205,12 @@ async def coinflip(ctx, amount: int, guess: str):
         await ctx.send(f"💀 You lost {amount} coins. Result: {result}")
     save_data(data)
 
-# Reaction based blackjack game
-@bot.command(name="bj")
+@bot.command(aliases=["bj"])
 async def blackjack(ctx, bet: int):
     data = load_data()
     uid = str(ctx.author.id)
     ensure_user(data, uid)
-    if bet <= 0 or bet > MAX_BET:
+    if bet < 1 or bet > MAX_BET:
         await ctx.send(f"❌ Bet must be between 1 and {MAX_BET}.")
         return
     if data[uid]["bal"] < bet:
@@ -232,46 +231,38 @@ async def blackjack(ctx, bet: int):
 
     player = [deal_card(), deal_card()]
     dealer = [deal_card(), deal_card()]
+    await ctx.send(f"Your hand: {player} (total {hand_value(player)})\nDealer shows: {dealer[0]}")
 
-    def hand_str(hand):
-        return ", ".join(str(c) for c in hand)
-
-    await ctx.send(f"Your hand: {hand_str(player)} (total {hand_value(player)})\nDealer shows: {dealer[0]}")
-
-    msg = await ctx.send("React with 🖐️ to HIT or ✋ to STAND.")
-
-    await msg.add_reaction("🖐️")  # hit
-    await msg.add_reaction("✋")   # stand
-
-    def check(reaction, user):
-        return user == ctx.author and str(reaction.emoji) in ["🖐️", "✋"] and reaction.message.id == msg.id
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() in ["hit", "stand"]
 
     while True:
+        await ctx.send("Type `hit` or `stand`.")
         try:
-            reaction, user = await bot.wait_for("reaction_add", timeout=30.0, check=check)
+            msg = await bot.wait_for("message", timeout=30.0, check=check)
         except:
             await ctx.send("⏰ Timeout! Game ended.")
             return
-
-        if str(reaction.emoji) == "🖐️":
+        if msg.content.lower() == "hit":
             player.append(deal_card())
             val = hand_value(player)
-            await ctx.send(f"You drew {player[-1]}. Total now {val}.")
+            await ctx.send(f"You drew {player[-1]}. Total now {val}")
             if val > 21:
                 data[uid]["bal"] -= bet
                 add_exp(data[uid], 10)
                 save_data(data)
                 await ctx.send("💥 Bust! You lose.")
                 return
-        else:  # stand
+        else:
             break
 
     while hand_value(dealer) < 17:
         dealer.append(deal_card())
+
     p_val = hand_value(player)
     d_val = hand_value(dealer)
 
-    await ctx.send(f"Dealer's hand: {hand_str(dealer)} (total {d_val})")
+    await ctx.send(f"Dealer's hand: {dealer} (total {d_val})")
 
     if d_val > 21 or p_val > d_val:
         win = int(bet * 1.8)
@@ -286,39 +277,33 @@ async def blackjack(ctx, bet: int):
         await ctx.send("💀 You lose.")
     save_data(data)
 
-# Reaction-based cups game
-@bot.command(name="cups")
+@bot.command()
 async def cups(ctx, bet: int):
     data = load_data()
     uid = str(ctx.author.id)
     ensure_user(data, uid)
-    if bet <= 0 or bet > MAX_BET:
+    if bet < 1 or bet > MAX_BET:
         await ctx.send(f"❌ Bet must be between 1 and {MAX_BET}.")
         return
     if data[uid]["bal"] < bet:
         await ctx.send("❌ Not enough coins.")
         return
 
-    cups_list = ["🥤", "🥤", "🥤"]
+    cups = ["🥤", "🥤", "🥤"]
     prize_cup = random.randint(1, 3)
-    display = "Choose the cup with the prize (1-3):\n" + " ".join([str(i) for i in range(1, 4)]) + "\n" + " ".join(cups_list)
-    msg = await ctx.send(display)
+    display = " ".join([f"{i+1}" for i in range(3)]) + "\n" + " ".join(cups)
+    await ctx.send(f"Cups game!\nGuess the cup with the prize (1-3):\n{display}")
 
-    emojis = ["1️⃣", "2️⃣", "3️⃣"]
-    for e in emojis:
-        await msg.add_reaction(e)
-
-    def check(reaction, user):
-        return user == ctx.author and str(reaction.emoji) in emojis and reaction.message.id == msg.id
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel and m.content in ["1", "2", "3"]
 
     try:
-        reaction, user = await bot.wait_for("reaction_add", timeout=30.0, check=check)
+        msg = await bot.wait_for("message", timeout=30.0, check=check)
     except:
         await ctx.send("⏰ Timeout! Game cancelled.")
         return
 
-    guess = emojis.index(str(reaction.emoji)) + 1
-    # Shuffle cups and get new prize position
+    guess = int(msg.content)
     positions = [1, 2, 3]
     random.shuffle(positions)
     real_pos = positions.index(prize_cup) + 1
@@ -334,5 +319,76 @@ async def cups(ctx, bet: int):
         await ctx.send(f"💀 Wrong! The prize was under cup {real_pos}. You lost {bet} coins.")
     save_data(data)
 
-bot.run(os.getenv("TOKEN"))
+# Horse racing command
 
+@bot.command()
+async def hr(ctx, bet: int):
+    data = load_data()
+    uid = str(ctx.author.id)
+    ensure_user(data, uid)
+
+    if bet < 1 or bet > MAX_BET:
+        await ctx.send(f"❌ Bet must be between 1 and {MAX_BET}.")
+        return
+    if data[uid]["bal"] < bet:
+        await ctx.send("❌ Not enough coins.")
+        return
+
+    horses = ["🏇1", "🏇2", "🏇3", "🏇4"]
+    positions = [0, 0, 0, 0]
+    finish_line = 15
+
+    msg = await ctx.send("🏁 Horse race starting! Get ready!")
+    await ctx.sleep(2)
+
+    winner = None
+    while max(positions) < finish_line:
+        await ctx.sleep(1)
+        # advance random horse(s)
+        for i in range(4):
+            positions[i] += random.choice([0,1,1,2])  # biased to move 1 or 2 steps
+        race_status = ""
+        for i in range(4):
+            race_status += f"{horses[i]}: " + "🏇" * positions[i] + "\n"
+        await msg.edit(content=race_status)
+    max_pos = max(positions)
+    winners = [horses[i] for i,p in enumerate(positions) if p == max_pos]
+    winner = random.choice(winners)
+
+    if winner[-1] == "1":
+        win_mult = 3
+    elif winner[-1] == "2":
+        win_mult = 2.5
+    elif winner[-1] == "3":
+        win_mult = 2
+    else:
+        win_mult = 1.5
+
+    if winner == "🏇1":
+        horse_num = 1
+    elif winner == "🏇2":
+        horse_num = 2
+    elif winner == "🏇3":
+        horse_num = 3
+    else:
+        horse_num = 4
+
+    if winner == "🏇" + str(horse_num):
+        if winner[-1] == str(horse_num):
+            pass
+
+    await ctx.send(f"🏆 Horse {horse_num} won!")
+    if bet and winner[-1] == str(horse_num):
+        win_amount = int(bet * win_mult)
+        data[uid]["bal"] += win_amount
+        add_exp(data[uid], 100)
+        save_data(data)
+        await ctx.send(f"🎉 You won {win_amount} coins!")
+    else:
+        data[uid]["bal"] -= bet
+        add_exp(data[uid], 10)
+        save_data(data)
+        await ctx.send(f"💀 You lost {bet} coins.")
+
+if __name__ == "__main__":
+    bot.run(os.getenv("DISCORD_TOKEN"))
