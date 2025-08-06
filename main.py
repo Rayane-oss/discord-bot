@@ -6,7 +6,8 @@ from datetime import datetime, timedelta
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-DATA_FILE = "economy.json"
+# Use Railway volume path for persistent storage, fallback to current dir
+DATA_FILE = os.getenv("VOLUME_PATH", ".") + "/economy.json"
 MAX_BET = 250_000
 COOLDOWN_SECONDS = 40 * 60  # 40 minutes cooldown for daily/work
 
@@ -62,7 +63,6 @@ async def update_crypto_prices():
         # Change price by +/- up to 5%
         change_percent = random.uniform(-0.05, 0.05)
         new_price = base_price * (1 + change_percent)
-        # Keep prices sensible, e.g., min 0.01
         CRYPTOCURRENCIES[crypto]["price"] = round(max(new_price, 0.01), 2)
     print("Updated crypto prices:", {k: v['price'] for k, v in CRYPTOCURRENCIES.items()})
 
@@ -412,13 +412,10 @@ async def hr(ctx, bet: int):
         await msg.edit(content=race_status)
         await asyncio.sleep(1.5)
 
-    if winner == 1: winner_name = "Thunder"
-    elif winner == 2: winner_name = "Blaze"
-    elif winner == 3: winner_name = "Rocket"
-    elif winner == 4: winner_name = "Shadow"
-    else: winner_name = "Comet"
+    winner_name = horses[winner]["name"]
 
-    if winner_name == "Thunder":  # You can pick the horse randomly or let user choose, here always Thunder
+    # For now user always bets on "Thunder" horse #1
+    if winner_name == "Thunder":
         winnings = int(bet * 3)
         data[uid]["bal"] += winnings
         await ctx.send(f"🎉 Your horse Thunder won! You win {winnings} coins!")
