@@ -77,6 +77,7 @@ def ensure_user(data, uid):
             "boosters": {},  # e.g., {"work_boost": expiry_timestamp_iso}
             "cooldowns": {},  # generic cooldown dict (e.g. robbery)
             "daily_quests": {"claimed": False, "quests": []},
+            "investments": {},  # {crypto: {"amount": int, "buy_price": float}}
         }
 
 def cooldown_left(last_time, cooldown_sec):
@@ -170,349 +171,188 @@ async def on_ready():
     await tree.sync(guild=None)  # Global sync to appear in all servers and DMs
     print("Slash commands globally synced.")
 
-# --------------- Slash commands -------------------
+# --------------- Your existing slash commands here ... (unchanged) ---------------
 
-@tree.command(name="bal", description="Check your balance and level")
-async def bal(interaction: discord.Interaction):
+# -- ADD NEW COMMANDS BELOW ---
+
+# Daily quests system
+@tree.command(name="dailyquests", description="View and claim daily quests")
+async def dailyquests(interaction: discord.Interaction):
     data = load_data()
     uid = str(interaction.user.id)
     ensure_user(data, uid)
     user = data[uid]
-    msg = (
-        f"💰 **Balance:** `{user['bal']:,}`\n"
-        f"🎖️ **Level:** `{user['lvl']}` (EXP: `{user['exp']}/1000`)\n"
-        f"👔 **Job:** `{user['job'] or 'None'}` (Lv. `{user.get('job_lvl',1)}`)"
-    )
+    dq = user["daily_quests"]
+
+    # If quests not set or reset, generate 3 simple quests
+    if not dq["quests"] or dq["claimed"]:
+        # Example quests: Work, Lootbox, Slots
+        quests = [
+            {"task": "work", "desc": "Work once", "completed": False, "reward": 1000},
+            {"task": "lootbox", "desc": "Open 1 lootbox", "completed": False, "reward": 1500},
+            {"task": "slots", "desc": "Play slots once", "completed": False, "reward": 1200},
+        ]
+        dq["quests"] = quests
+        dq["claimed"] = False
+        save_data(data)
+    
+    # Check completion status (for demo, we just mark completed manually here, you may link to events)
+    msg = "**🎯 Daily Quests:**\n"
+    for q in dq["quests"]:
+        status = "✅ Completed" if q["completed"] else "❌ Not completed"
+        msg += f"• {q['desc']} — {status} — Reward: {q['reward']} coins\n"
+
+    if dq["claimed"]:
+        msg += "\n✅ You already claimed today's quests reward."
+    else:
+        msg += "\nUse `/claimquests` to claim your reward if all quests completed."
+
     await interaction.response.send_message(msg)
 
-@tree.command(name="daily", description="Claim your daily reward (cooldown)")
-async def daily(interaction: discord.Interaction):
+# Claim daily quests reward
+@tree.command(name="claimquests", description="Claim your daily quests reward if completed")
+async def claimquests(interaction: discord.Interaction):
     data = load_data()
     uid = str(interaction.user.id)
     ensure_user(data, uid)
     user = data[uid]
-    left = cooldown_left(user["daily"], BASE_COOLDOWN)
-    if left > 0:
-        await interaction.response.send_message(f"🕒 You must wait **{int(left // 60)}m {int(left % 60)}s** for your daily reward.")
+    dq = user["daily_quests"]
+
+    if dq["claimed"]:
+        await interaction.response.send_message("❌ You already claimed your daily quests reward today.")
         return
-    reward = random.randint(1500, 3500)
-    user["bal"] += reward
-    user["daily"] = datetime.utcnow().isoformat()
-    add_exp(user, 60)
-    earned_achievements = update_achievements(data, uid)
+
+    if not dq["quests"]:
+        await interaction.response.send_message("❌ No daily quests found. Use `/dailyquests` to generate them.")
+        return
+
+    # Check if all completed
+    if not all(q["completed"] for q in dq["quests"]):
+        await interaction.response.send_message("❌ You haven't completed all quests yet.")
+        return
+
+    total_reward = sum(q["reward"] for q in dq["quests"])
+    user["bal"] += total_reward
+    dq["claimed"] = True
     save_data(data)
-    msg = (
-        f"✅ You collected your daily reward:\n"
-        f"➤ +{reward:,} coins\n"
-        f"➤ +60 EXP"
-    )
-    for key, desc, rew in earned_achievements:
-        msg += f"\n\n🏆 **Achievement unlocked:**\n• {desc} (+{rew:,} coins)"
-    await interaction.response.send_message(msg)
+    await interaction.response.send_message(f"✅ You claimed **{total_reward} coins** from daily quests!")
 
-@tree.command(name="work", description="Work for coins (cooldown, can be boosted)")
-async def work(interaction: discord.Interaction):
-    data = load_data()
-    uid = str(interaction.user.id)
-    ensure_user(data, uid)
-    user = data[uid]
-    cooldown = get_work_cooldown(user)
-    left = cooldown_left(user["work"], cooldown)
-    if left > 0:
-        await interaction.response.send_message(f"🕒 You need to wait **{int(left // 60)}m {int(left % 60)}s** before working again.")
+# Invest command: invest coins into cryptos, store buy price
+@tree.command(name="invest", description="Invest coins into a cryptocurrency")
+@app_commands.describe(crypto="Crypto name", amount="Amount of coins to invest")
+async def invest(interaction: discord.Interaction, crypto: str, amount: int):
+    crypto = crypto.lower()
+    if crypto not in CRYPTOCURRENCIES:
+        await interaction.response.send_message("❌ That crypto is not available.")
         return
-    base_pay = random.randint(1100, 2500)
-    job_mult = 1.0
-    if user["job"] in JOBS:
-        job_mult = JOBS[user["job"]]["base_pay"] + (user["job_lvl"] - 1) * 0.1
-    pay = int(base_pay * job_mult)
-    user["bal"] += pay
-    user["work"] = datetime.utcnow().isoformat()
-    add_exp(user, 45)
-    add_job_exp(user, 30)
-    earned_achievements = update_achievements(data, uid)
-    save_data(data)
-    msg = (
-        f"💼 You worked as **{user['job'] or 'a freelancer'}** and earned **{pay:,} coins**\n"
-        f"➤ +45 EXP"
-    )
-    for key, desc, rew in earned_achievements:
-        msg += f"\n\n🏆 **Achievement unlocked:**\n• {desc} (+{rew:,} coins)"
-    await interaction.response.send_message(msg)
-
-@tree.command(name="inv", description="Show your inventory")
-async def inv(interaction: discord.Interaction):
-    data = load_data()
-    uid = str(interaction.user.id)
-    ensure_user(data, uid)
-    inv = data[uid]["inv"]
-    if not inv or all(v <= 0 for v in inv.values()):
-        await interaction.response.send_message("🎒 Your inventory is empty.")
-        return
-    msg = "**🎒 Inventory:**\n"
-    for item, amount in inv.items():
-        if amount > 0:
-            msg += f"• {item.capitalize()} x{amount}\n"
-    await interaction.response.send_message(msg)
-
-@tree.command(name="job", description="Choose or view your job")
-@app_commands.describe(job_name="Choose a job: hacker, trader, miner")
-async def job(interaction: discord.Interaction, job_name: str = None):
-    data = load_data()
-    uid = str(interaction.user.id)
-    ensure_user(data, uid)
-    user = data[uid]
-    if job_name is None:
-        if user["job"]:
-            await interaction.response.send_message(
-                f"👔 Your current job:\n"
-                f"• {user['job'].capitalize()} {JOBS[user['job']]['emoji']} Lv. {user['job_lvl']}"
-            )
-        else:
-            await interaction.response.send_message(f"ℹ️ You don't have a job.\nChoose one with `/job job_name:hacker|trader|miner`")
-        return
-    job_name = job_name.lower()
-    if job_name not in JOBS:
-        await interaction.response.send_message("❌ Invalid job. Choose from: hacker, trader, miner.")
-        return
-    user["job"] = job_name
-    user["job_lvl"] = 1
-    user["job_exp"] = 0
-    save_data(data)
-    await interaction.response.send_message(f"✅ You started working as a **{job_name.capitalize()}** {JOBS[job_name]['emoji']}")
-
-@tree.command(name="shop", description="View crypto shop")
-async def shop(interaction: discord.Interaction):
-    msg = "**🪙 Crypto Shop (prices update hourly):**\n"
-    for crypto, info in CRYPTOCURRENCIES.items():
-        price_str = f"{info['price']:,}" if info['price'] >= 1 else f"{info['price']:.4f}"
-        msg += f"• `{crypto}`: {price_str} coins — {info['desc']}\n"
-    msg += "\nUse `/buy item amount` to purchase multiple."
-    await interaction.response.send_message(msg)
-
-@tree.command(name="buy", description="Buy crypto from the shop")
-@app_commands.describe(item="Crypto to buy", amount="Amount to buy")
-async def buy(interaction: discord.Interaction, item: str, amount: int = 1):
     if amount <= 0:
-        await interaction.response.send_message("❌ Amount must be a positive number.")
+        await interaction.response.send_message("❌ Amount must be positive.")
         return
+
     data = load_data()
     uid = str(interaction.user.id)
-    item = item.lower()
     ensure_user(data, uid)
-    if item not in CRYPTOCURRENCIES:
-        await interaction.response.send_message("❌ That crypto is not available in the shop.")
-        return
-    cost = int(CRYPTOCURRENCIES[item]["price"] * amount)
-    if data[uid]["bal"] < cost:
-        await interaction.response.send_message(f"❌ You don't have enough coins to buy {amount} {item}(s) ({cost:,} coins).")
-        return
-    data[uid]["bal"] -= cost
-    inv = data[uid]["inv"]
-    inv[item] = inv.get(item, 0) + amount
-    add_exp(data[uid], 20 * amount)
-    save_data(data)
-    await interaction.response.send_message(f"✅ You bought **{amount} {item}(s)** for **{cost:,} coins**.")
+    user = data[uid]
 
-@tree.command(name="sell", description="Sell crypto from your inventory")
-@app_commands.describe(item="Crypto to sell", amount="Amount to sell")
-async def sell(interaction: discord.Interaction, item: str, amount: int = 1):
+    if user["bal"] < amount:
+        await interaction.response.send_message("❌ You don't have enough coins to invest.")
+        return
+
+    price = CRYPTOCURRENCIES[crypto]["price"]
+    # Store investment amount and buy price weighted average if already invested
+    inv = user.setdefault("investments", {})
+    if crypto in inv:
+        total_amount = inv[crypto]["amount"] + amount
+        total_cost = inv[crypto]["amount"] * inv[crypto]["buy_price"] + amount * price
+        avg_price = total_cost / total_amount
+        inv[crypto]["amount"] = total_amount
+        inv[crypto]["buy_price"] = avg_price
+    else:
+        inv[crypto] = {"amount": amount, "buy_price": price}
+
+    user["bal"] -= amount
+    save_data(data)
+    await interaction.response.send_message(f"✅ You invested **{amount} coins** in {crypto} at price {price} coins.")
+
+# Check investments and their current value and profit/loss
+@tree.command(name="portfolio", description="Check your crypto investments portfolio")
+async def portfolio(interaction: discord.Interaction):
+    data = load_data()
+    uid = str(interaction.user.id)
+    ensure_user(data, uid)
+    user = data[uid]
+
+    inv = user.get("investments", {})
+    if not inv:
+        await interaction.response.send_message("📉 You have no active investments.")
+        return
+
+    msg = "**📈 Your Investments Portfolio:**\n"
+    total_profit = 0
+    total_value = 0
+    for crypto, info in inv.items():
+        curr_price = CRYPTOCURRENCIES.get(crypto, {}).get("price", 0)
+        amount = info["amount"]
+        buy_price = info["buy_price"]
+        curr_value = amount * curr_price
+        profit = curr_value - (amount * buy_price)
+        total_profit += profit
+        total_value += curr_value
+        profit_str = f"+{profit:.2f}" if profit >= 0 else f"{profit:.2f}"
+        msg += f"• {crypto.capitalize()}: {amount} coins bought at {buy_price:.2f} - Current price: {curr_price:.2f} - Value: {curr_value:.2f} coins - Profit: {profit_str} coins\n"
+
+    msg += f"\nTotal portfolio value: {total_value:.2f} coins\nTotal profit/loss: {total_profit:.2f} coins"
+    await interaction.response.send_message(msg)
+
+# Sell investments command: sell amount of crypto investment at current price
+@tree.command(name="sellinv", description="Sell part of your crypto investments")
+@app_commands.describe(crypto="Crypto name", amount="Amount to sell")
+async def sellinv(interaction: discord.Interaction, crypto: str, amount: int):
+    crypto = crypto.lower()
     if amount <= 0:
-        await interaction.response.send_message("❌ Amount must be a positive number.")
+        await interaction.response.send_message("❌ Amount must be positive.")
         return
+
     data = load_data()
     uid = str(interaction.user.id)
-    item = item.lower()
     ensure_user(data, uid)
-    inv = data[uid]["inv"]
-    if item not in inv or inv[item] < amount:
-        await interaction.response.send_message("❌ You don't own that many items to sell.")
+    user = data[uid]
+    inv = user.get("investments", {})
+
+    if crypto not in inv or inv[crypto]["amount"] < amount:
+        await interaction.response.send_message("❌ You don't have that much investment to sell.")
         return
-    price = int(CRYPTOCURRENCIES.get(item, {"price":0})["price"] * 0.6 * amount)
-    inv[item] -= amount
-    data[uid]["bal"] += price
+
+    curr_price = CRYPTOCURRENCIES.get(crypto, {}).get("price", 0)
+    if curr_price == 0:
+        await interaction.response.send_message("❌ Cannot sell now, crypto price unknown.")
+        return
+
+    revenue = amount * curr_price
+    inv[crypto]["amount"] -= amount
+    if inv[crypto]["amount"] == 0:
+        del inv[crypto]
+
+    user["bal"] += int(revenue)
     save_data(data)
-    await interaction.response.send_message(f"✅ You sold **{amount} {item}(s)** for **{price:,} coins**.")
+    await interaction.response.send_message(f"✅ You sold **{amount} {crypto}** investment for **{int(revenue)} coins**.")
 
-@tree.command(name="lootbox", description="Buy and open a lootbox for random rewards (cost 5000 coins)")
-async def lootbox(interaction: discord.Interaction):
-    data = load_data()
-    uid = str(interaction.user.id)
-    ensure_user(data, uid)
-    user = data[uid]
-    cost = 5000
-    if user["bal"] < cost:
-        await interaction.response.send_message(f"❌ You need **{cost:,} coins** to buy a lootbox.")
-        return
-    user["bal"] -= cost
-
-    loot = random.choice(LOOTBOX_ITEMS)
-    if loot["type"] == "crypto":
-        amount = random.randint(loot["min"], loot["max"])
-        user["inv"][loot["item"]] = user["inv"].get(loot["item"], 0) + amount
-        msg = f"🎁 You opened a lootbox and got **{amount} {loot['item']}**!"
-    else:
-        add_booster(user, loot["item"], loot["duration"])
-        msg = f"🎁 You opened a lootbox and got a **{loot['item']}** booster active for {loot['duration']//60} minutes!"
-
-    add_exp(user, 50)
-    save_data(data)
-    await interaction.response.send_message(msg)
-
-@tree.command(name="boosters", description="Show your active boosters")
-async def boosters(interaction: discord.Interaction):
-    data = load_data()
-    uid = str(interaction.user.id)
-    ensure_user(data, uid)
-    user = data[uid]
-    msg = "**🎁 Your Active Boosters:**\n"
-    now = datetime.utcnow()
-    active = False
-    for booster, expiry_str in user.get("boosters", {}).items():
-        expiry = datetime.fromisoformat(expiry_str)
-        if expiry > now:
-            active = True
-            remaining = expiry - now
-            m, s = divmod(int(remaining.total_seconds()), 60)
-            msg += f"• {booster}: {m}m {s}s remaining\n"
-    if not active:
-        msg += "None"
-    await interaction.response.send_message(msg)
-
-@tree.command(name="rob", description="Attempt to rob another user (30 min cooldown)")
-@app_commands.describe(target="User to rob")
-async def rob(interaction: discord.Interaction, target: discord.Member):
-    if target.id == interaction.user.id:
-        await interaction.response.send_message("❌ You cannot rob yourself.")
-        return
-    data = load_data()
-    uid = str(interaction.user.id)
-    tid = str(target.id)
-    ensure_user(data, uid)
-    ensure_user(data, tid)
-    user = data[uid]
-    victim = data[tid]
-
-    # Rob cooldown
-    last_rob = user["cooldowns"].get("rob")
-    left = cooldown_left(last_rob, 30*60)
-    if left > 0:
-        await interaction.response.send_message(f"🕒 You must wait **{int(left//60)}m {int(left%60)}s** before robbing again.")
-        return
-
-    if victim["bal"] < 100:
-        await interaction.response.send_message("❌ Target doesn't have enough coins to rob.")
-        return
-
-    success = random.random() < 0.5  # 50% chance
-    if success:
-        stolen = random.randint(100, min(1000, victim["bal"]))
-        victim["bal"] -= stolen
-        user["bal"] += stolen
-        msg = f"💰 You successfully robbed **{stolen:,} coins** from {target.mention}!"
-    else:
-        penalty = random.randint(50, 200)
-        user["bal"] = max(0, user["bal"] - penalty)
-        msg = f"❌ Robbery failed! You paid a **{penalty:,} coin** penalty."
-
-    user["cooldowns"]["rob"] = datetime.utcnow().isoformat()
-    save_data(data)
-    await interaction.response.send_message(msg)
-
-@tree.command(name="slots", description="Play a slot machine (bet coins)")
-@app_commands.describe(bet="Coins to bet (max 250,000)")
-async def slots(interaction: discord.Interaction, bet: int):
-    if bet <= 0:
-        await interaction.response.send_message("❌ Bet must be positive.")
-        return
-    if bet > MAX_BET:
-        await interaction.response.send_message(f"❌ Max bet is {MAX_BET:,} coins.")
-        return
-    data = load_data()
-    uid = str(interaction.user.id)
-    ensure_user(data, uid)
-    user = data[uid]
-    if user["bal"] < bet:
-        await interaction.response.send_message("❌ You don't have enough coins to bet that amount.")
-        return
-
-    symbols = ["🍒", "🍋", "🔔", "⭐", "🍀"]
-    result = [random.choice(symbols) for _ in range(3)]
-
-    user["bal"] -= bet
-
-    # Calculate winnings
-    if len(set(result)) == 1:  # All symbols match
-        win = bet * 5
-        user["bal"] += win
-        outcome = f"🎉 Jackpot! You won **{win:,} coins**!"
-    elif len(set(result)) == 2:
-        win = bet * 2
-        user["bal"] += win
-        outcome = f"😊 Nice! You won **{win:,} coins**!"
-    else:
-        win = 0
-        outcome = f"😞 No luck this time, you lost **{bet:,} coins**."
-
-    save_data(data)
-    await interaction.response.send_message(f"🎰 {' '.join(result)}\n{outcome}")
-
-@tree.command(name="coinflip", description="Flip a coin and bet coins")
-@app_commands.describe(choice="Heads or Tails", bet="Coins to bet (max 250,000)")
-async def coinflip(interaction: discord.Interaction, choice: str, bet: int):
-    choice = choice.lower()
-    if choice not in ["heads", "tails"]:
-        await interaction.response.send_message("❌ Choice must be 'heads' or 'tails'.")
-        return
-    if bet <= 0:
-        await interaction.response.send_message("❌ Bet must be positive.")
-        return
-    if bet > MAX_BET:
-        await interaction.response.send_message(f"❌ Max bet is {MAX_BET:,} coins.")
-        return
-    data = load_data()
-    uid = str(interaction.user.id)
-    ensure_user(data, uid)
-    user = data[uid]
-    if user["bal"] < bet:
-        await interaction.response.send_message("❌ You don't have enough coins to bet that amount.")
-        return
-
-    flip_result = random.choice(["heads", "tails"])
-    user["bal"] -= bet
-    if choice == flip_result:
-        win = bet * 2
-        user["bal"] += win
-        outcome = f"🎉 It's {flip_result.capitalize()}! You won **{win:,} coins**!"
-    else:
-        outcome = f"😞 It's {flip_result.capitalize()}! You lost **{bet:,} coins**."
-
-    save_data(data)
-    await interaction.response.send_message(outcome)
-
-@tree.command(name="achievements", description="View your achievements")
-async def achievements(interaction: discord.Interaction):
-    data = load_data()
-    uid = str(interaction.user.id)
-    ensure_user(data, uid)
-    user = data[uid]
-    if not user["achievements"]:
-        await interaction.response.send_message("🏆 You have no achievements yet.")
-        return
-    msg = "**🏆 Your Achievements:**\n"
-    for ach_key in user["achievements"]:
-        msg += f"• {ACHIEVEMENTS[ach_key]['desc']}\n"
-    await interaction.response.send_message(msg)
-
-# --- Admin commands (only bot owner) ---
-@tree.command(name="resetdata", description="Reset all user data (Admin only)")
-async def resetdata(interaction: discord.Interaction):
+# Reset cooldowns command (admin only)
+@tree.command(name="resetcooldowns", description="Reset all cooldowns for all users (Admin only)")
+async def resetcooldowns(interaction: discord.Interaction):
     owner_id = bot.owner_id or bot.application.owner.id
     if interaction.user.id != owner_id:
         await interaction.response.send_message("❌ You are not authorized to use this command.")
         return
-    save_data({})
-    await interaction.response.send_message("✅ All data has been reset.")
+    data = load_data()
+    for uid in data:
+        data[uid]["cooldowns"] = {}
+    save_data(data)
+    await interaction.response.send_message("✅ All cooldowns have been reset.")
+
+# You can add other admin commands as needed...
+
+# -------------- END OF ADDITIONS --------------
 
 # Run the bot
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
